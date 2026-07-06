@@ -17,6 +17,8 @@ from scan_profile import RainbowProfileConfig, make_rainbow_profile, transform_p
 DEFAULT_EDGE_OFFSET_FROM_WALL = 0.0
 DEFAULT_ROW_SPACING = 1.60
 DEFAULT_SPACING_FACTOR = 1.0
+DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.00, 0.95, 0.90, 0.85, 0.80)
+TARGET_COVERAGE_PERCENT = 95.0
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
 DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
@@ -29,6 +31,7 @@ VERTICAL_SLOPE_TOLERANCE = 0.02
 VERTICAL_X_GROUP_TOLERANCE_M = 0.02
 VERTICAL_LINE_COVERAGE_RATIO = 0.60
 OVERLAP_SAMPLE_GRID_SIZE = 28
+_TOUCHING_ANGULAR_STEP_CACHE: dict[tuple[float, float, float, float, int], float] = {}
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,15 @@ class CoverageEstimate:
 
 
 @dataclass(frozen=True)
+class CircularSpacingCandidate:
+    spacing_factor: float
+    coverage_percent: float
+    scan_count: int
+    travel_distance_m: float
+    selected: bool = False
+
+
+@dataclass(frozen=True)
 class OuterEdgeSweepMission:
     units: str
     tank_center_m: dict[str, float]
@@ -103,6 +115,9 @@ class OuterEdgeSweepMission:
     profile_tangential_span_m: float
     profile_wall_contact_span_m: float
     spacing_factor: float
+    selected_circular_spacing_factor: float | None
+    circular_spacing_candidates: list[CircularSpacingCandidate]
+    circular_spacing_selection_reason: str | None
     max_circular_gap_fraction: float
     circular_stop_backoff_rows: int
     circular_rows: list[CircularSweepRow]
@@ -182,15 +197,11 @@ def _generate_sweep_row_poses(
     clockwise: bool,
 ) -> tuple[list[SweepPose], CircularSweepRow] | None:
     touching_angle = _touching_angular_step(sweep_radius, profile_config)
-    max_non_overlapping_count = int(math.floor((2.0 * math.pi) / touching_angle + 1e-9))
-    if max_non_overlapping_count < 3:
+    target_arc_step = touching_angle * sweep_radius * spacing_factor
+    if target_arc_step <= 0.0:
         return None
-
-    pose_count = max(3, int(math.floor(max_non_overlapping_count / max(spacing_factor, 1e-9))))
-    pose_count = min(pose_count, max_non_overlapping_count)
+    pose_count = max(3, int(math.ceil((2.0 * math.pi * sweep_radius) / target_arc_step)))
     angular_spacing = 2.0 * math.pi / pose_count
-    if angular_spacing + 1e-9 < touching_angle:
-        return None
 
     profile_area = _polygon_area(make_rainbow_profile(profile_config))
     gap_arc_length = max(0.0, angular_spacing - touching_angle) * sweep_radius
@@ -295,7 +306,7 @@ def _apply_circular_stop_backoff(
     if backoff_rows <= 0 or not rows:
         return CircularSweepPlan(rows, poses, rejected_radius_m, stop_reason)
 
-    keep_count = max(0, len(rows) - backoff_rows)
+    keep_count = max(1, len(rows) - backoff_rows)
     if keep_count == len(rows):
         return CircularSweepPlan(rows, poses, rejected_radius_m, stop_reason)
 
@@ -348,6 +359,9 @@ def build_outer_edge_sweep_mission(
         profile_tangential_span_m=profile_tangential_span,
         profile_wall_contact_span_m=profile_wall_contact_span,
         spacing_factor=spacing_factor,
+        selected_circular_spacing_factor=None,
+        circular_spacing_candidates=[],
+        circular_spacing_selection_reason=None,
         max_circular_gap_fraction=max_circular_gap_fraction,
         circular_stop_backoff_rows=circular_stop_backoff_rows,
         circular_rows=circular_plan.rows,
@@ -377,7 +391,7 @@ def build_outer_edge_sweep_mission(
     )
 
 
-def build_mission_plan(
+def _build_mission_plan_once(
     model: GeometryModel,
     *,
     outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
@@ -391,7 +405,7 @@ def build_mission_plan(
     profile_config: RainbowProfileConfig | None = None,
     clockwise: bool = False,
 ) -> OuterEdgeSweepMission:
-    """Build edge sweeps followed by v1 vertical interior coverage."""
+    """Build one mission using one circular spacing factor."""
     if vertical_spacing_factor <= 0.0:
         raise ValueError("Vertical spacing factor must be positive.")
     if not 0.0 <= overlap_discard_threshold <= 1.0:
@@ -438,6 +452,134 @@ def build_mission_plan(
         total_scan_count=len(edge_mission.poses) + len(interior_poses),
         poses=edge_mission.poses + interior_poses,
     )
+
+
+def build_mission_plan(
+    model: GeometryModel,
+    *,
+    outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
+    row_spacing_m: float = DEFAULT_ROW_SPACING,
+    spacing_factor: float = DEFAULT_SPACING_FACTOR,
+    circular_spacing_candidates: tuple[float, ...] | None = DEFAULT_CIRCULAR_SPACING_CANDIDATES,
+    max_circular_gap_fraction: float = DEFAULT_MAX_CIRCULAR_GAP_FRACTION,
+    circular_stop_backoff_rows: int = DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS,
+    vertical_spacing_factor: float = DEFAULT_VERTICAL_SPACING_FACTOR,
+    overlap_discard_threshold: float = DEFAULT_OVERLAP_DISCARD_THRESHOLD,
+    interior_enabled: bool = True,
+    profile_config: RainbowProfileConfig | None = None,
+    clockwise: bool = False,
+) -> OuterEdgeSweepMission:
+    """Build a mission, selecting circular spacing by coverage when candidates are provided."""
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    if not circular_spacing_candidates:
+        return _build_mission_plan_once(
+            model,
+            outer_edge_offset_m=outer_edge_offset_m,
+            row_spacing_m=row_spacing_m,
+            spacing_factor=spacing_factor,
+            max_circular_gap_fraction=max_circular_gap_fraction,
+            circular_stop_backoff_rows=circular_stop_backoff_rows,
+            vertical_spacing_factor=vertical_spacing_factor,
+            overlap_discard_threshold=overlap_discard_threshold,
+            interior_enabled=interior_enabled,
+            profile_config=profile_config,
+            clockwise=clockwise,
+        )
+
+    candidate_missions: list[tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]] = []
+    for candidate_factor in circular_spacing_candidates:
+        if candidate_factor < 0.80:
+            continue
+        mission = _build_mission_plan_once(
+            model,
+            outer_edge_offset_m=outer_edge_offset_m,
+            row_spacing_m=row_spacing_m,
+            spacing_factor=candidate_factor,
+            max_circular_gap_fraction=max_circular_gap_fraction,
+            circular_stop_backoff_rows=circular_stop_backoff_rows,
+            vertical_spacing_factor=vertical_spacing_factor,
+            overlap_discard_threshold=overlap_discard_threshold,
+            interior_enabled=interior_enabled,
+            profile_config=profile_config,
+            clockwise=clockwise,
+        )
+        coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
+        travel_distance = _estimate_mission_travel_distance(mission.poses)
+        candidate_missions.append((candidate_factor, mission, coverage, travel_distance))
+
+    if not candidate_missions:
+        raise ValueError("No valid circular spacing candidates were provided.")
+
+    selected = _select_circular_spacing_candidate(candidate_missions)
+
+    selected_factor, selected_mission, _selected_coverage, _selected_travel = selected
+    candidate_records = [
+        CircularSpacingCandidate(
+            spacing_factor=factor,
+            coverage_percent=coverage.covered_percent,
+            scan_count=len(mission.poses),
+            travel_distance_m=travel_distance,
+            selected=math.isclose(factor, selected_factor),
+        )
+        for factor, mission, coverage, travel_distance in candidate_missions
+    ]
+    return replace(
+        selected_mission,
+        spacing_factor=selected_factor,
+        selected_circular_spacing_factor=selected_factor,
+        circular_spacing_candidates=candidate_records,
+        circular_spacing_selection_reason=_circular_spacing_selection_reason(candidate_records),
+    )
+
+
+def _select_circular_spacing_candidate(
+    candidates: list[tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]],
+) -> tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]:
+    target_candidates = [
+        candidate for candidate in candidates if candidate[2].covered_percent >= TARGET_COVERAGE_PERCENT
+    ]
+    if target_candidates:
+        return min(
+            target_candidates,
+            key=lambda candidate: (
+                len(candidate[1].poses),
+                candidate[3],
+                -candidate[0],
+            ),
+        )
+
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate[2].covered_percent,
+            -len(candidate[1].poses),
+            -candidate[3],
+            candidate[0],
+        ),
+    )
+
+
+def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate]) -> str | None:
+    selected = next((candidate for candidate in candidates if candidate.selected), None)
+    if selected is None:
+        return None
+    if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
+        return (
+            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying spacing"
+        )
+    return (
+        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available coverage "
+        "without going below the allowed overlap limit"
+    )
+
+
+def _estimate_mission_travel_distance(poses: list[SweepPose]) -> float:
+    if len(poses) < 2:
+        return 0.0
+    distance = 0.0
+    for first, second in zip(poses, poses[1:]):
+        distance += math.hypot(second.x_m - first.x_m, second.y_m - first.y_m)
+    return float(distance)
 
 
 def detect_vertical_plate_columns(
@@ -928,11 +1070,18 @@ def plot_outer_edge_sweep(
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
-    ax.set_title("Edge sweeps plus interior vertical coverage")
     ax.grid(True, alpha=0.22)
     geometry_legend = ax.legend(loc="upper left", fontsize=8)
     ax.add_artist(geometry_legend)
     coverage = _estimate_tank_coverage(mission, profile_config)
+    if mission.selected_circular_spacing_factor is None:
+        ax.set_title(f"Mission preview - coverage {coverage.covered_percent:.1f}%")
+    else:
+        ax.set_title(
+            "Mission preview - "
+            f"coverage {coverage.covered_percent:.1f}%, "
+            f"circular spacing {mission.selected_circular_spacing_factor:.2f}"
+        )
     coverage_handles = [
         Line2D([], [], color="none", label=f"Scan profiles: {coverage.total_profiles}"),
         Line2D([], [], color="none", label=f"Tank covered: {coverage.covered_percent:.1f}%"),
@@ -985,6 +1134,22 @@ def print_mission_summary(
     print(f"Rotated side-guard scans kept: {side_guard_count}")
     print(f"Interior vertical scans discarded by overlap: {mission.interior_discarded_count}")
     print(f"Total mission scans: {len(mission.poses)}")
+    if mission.circular_spacing_candidates:
+        print("Circular spacing comparison")
+        print("circular_spacing | coverage_% | scans | travel_m")
+        for candidate in mission.circular_spacing_candidates:
+            selected_marker = "  <-- selected" if candidate.selected else ""
+            print(
+                f"{candidate.spacing_factor:<16.2f} | "
+                f"{candidate.coverage_percent:<10.1f} | "
+                f"{candidate.scan_count:<5d} | "
+                f"{candidate.travel_distance_m:<8.1f}"
+                f"{selected_marker}"
+            )
+        if mission.selected_circular_spacing_factor is not None:
+            print(f"Selected circular spacing factor: {mission.selected_circular_spacing_factor:.2f}")
+        if mission.circular_spacing_selection_reason:
+            print(f"Reason: {mission.circular_spacing_selection_reason}")
     print(f"Direction: {mission.direction}")
     if json_path is not None:
         print(f"JSON output: {json_path}")
@@ -1066,6 +1231,17 @@ def _touching_row_spacing(outer_sweep_radius: float, profile_config: RainbowProf
 
 def _touching_angular_step(sweep_radius: float, profile_config: RainbowProfileConfig) -> float:
     """Find the angular separation where neighboring profile polygons just meet."""
+    cache_key = (
+        round(float(sweep_radius), 6),
+        round(float(profile_config.width), 6),
+        round(float(profile_config.arc_radius), 6),
+        round(float(profile_config.side_height), 6),
+        int(profile_config.arc_samples),
+    )
+    cached = _TOUCHING_ANGULAR_STEP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     local_profile = make_rainbow_profile(profile_config)
     first_profile = transform_profile(local_profile, sweep_radius, 0.0, 0.0)
 
@@ -1103,7 +1279,9 @@ def _touching_angular_step(sweep_radius: float, profile_config: RainbowProfileCo
             low = midpoint
         else:
             high = midpoint
-    return (low + high) / 2.0
+    touching_step = (low + high) / 2.0
+    _TOUCHING_ANGULAR_STEP_CACHE[cache_key] = touching_step
+    return touching_step
 
 
 def _touching_vertical_step(local_profile: np.ndarray) -> float:
