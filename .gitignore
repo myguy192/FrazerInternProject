@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-
 _tmp*.png
-=======
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -209,4 +206,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
->>>>>>> ad1b5b451a6ae99e30c8e10424c108455fa2a034
+
+# Tank planner generated outputs
+*.pyc
+mission_plan.json
+mission_plan.csv
+mission_preview.png
+outer_edge_sweep.json
+outer_edge_sweep.csv
+outer_edge_sweep_preview.png
+*_backup.py
+*BROKEN*
+*ruined*

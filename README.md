@@ -53,3 +53,37 @@ Add a Path display, set the topic to `/coverage_path`, and set the fixed frame t
 | `COLUMN_RADIUS` | 0.3 m | Structural column radius |
 | `COLUMN_CLEARANCE` | 0.3 m | Clearance margin around columns |
 | `SAMPLE_ARC_LENGTH` | 0.06 m | Distance between waypoints |
+
+## DXF Importer v1
+
+`dxf_importer.py` imports and visualizes tank floor DXF geometry before any planning step.
+
+Install the DXF parser dependency:
+```bash
+pip install ezdxf
+```
+
+Run the importer with plotting:
+```bash
+python dxf_importer.py path/to/tank_floor.dxf
+```
+
+Run only the import summary:
+```bash
+python dxf_importer.py path/to/tank_floor.dxf --no-plot
+```
+
+Save a plot image without opening a window:
+```bash
+python dxf_importer.py path/to/tank_floor.dxf --no-plot --save-plot imported_geometry.png
+```
+
+Supported v1 modelspace entities:
+
+- `LINE`
+- `LWPOLYLINE`
+- `POLYLINE`
+- `ARC`
+- `CIRCLE`
+
+Unsupported entities are reported in the summary instead of stopping the import. The importer preserves raw entity metadata, layer names, supported geometry objects, and simple drawing bounds so later tools can add tank boundary detection, plate detection, weld extraction, node generation, and scan profile placement.
