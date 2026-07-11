@@ -18,6 +18,7 @@ DEFAULT_EDGE_OFFSET_FROM_WALL = 0.0
 DEFAULT_ROW_SPACING = 1.60
 DEFAULT_SPACING_FACTOR = 1.0
 DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.00, 0.95, 0.90, 0.85, 0.80)
+DEFAULT_MAX_CIRCULAR_ROWS = 2
 TARGET_COVERAGE_PERCENT = 95.0
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
@@ -31,6 +32,11 @@ VERTICAL_SLOPE_TOLERANCE = 0.02
 VERTICAL_X_GROUP_TOLERANCE_M = 0.02
 VERTICAL_LINE_COVERAGE_RATIO = 0.60
 OVERLAP_SAMPLE_GRID_SIZE = 28
+CIRCULAR_GAP_TOLERANCE_M = 0.002
+CIRCULAR_TEST_BAND_HALF_WIDTH_M = 0.005
+CIRCULAR_TEST_ANGULAR_SAMPLES = 17
+CIRCULAR_MAX_SPACING_ADJUSTMENTS = 256
+CIRCULAR_MAX_PROFILE_COUNT = 10000
 _TOUCHING_ANGULAR_STEP_CACHE: dict[tuple[float, float, float, float, int], float] = {}
 
 
@@ -78,6 +84,11 @@ class CircularSweepRow:
     arc_spacing_m: float
     estimated_gap_area_m2: float
     estimated_gap_fraction: float
+    max_neighbor_gap_distance_m: float
+    minimum_neighbor_contact_passed: bool
+    wraparound_passed: bool
+    continuous_coverage_verified: bool
+    spacing_adjustments: int
 
 
 @dataclass(frozen=True)
@@ -97,7 +108,8 @@ class CoverageEstimate:
 
 @dataclass(frozen=True)
 class CircularSpacingCandidate:
-    spacing_factor: float
+    circular_rows: int
+    spacing_factor: float | None
     coverage_percent: float
     scan_count: int
     travel_distance_m: float
@@ -158,6 +170,14 @@ def estimate_tank_circle_from_geometry(model: GeometryModel) -> TankCircleEstima
     )
 
 
+def predict_tank_layout_from_geometry(model: GeometryModel, config: Any | None = None) -> Any:
+    """Explicit opt-in bridge from imported geometry to the standalone layout predictor."""
+    from tank_layout_predictor import observed_geometry_from_dxf, predict_tank_layout
+
+    observations = observed_geometry_from_dxf(model)
+    return predict_tank_layout(observations, config=config)
+
+
 def generate_outer_edge_sweep_poses(
     tank_center: tuple[float, float],
     tank_radius: float,
@@ -196,49 +216,188 @@ def _generate_sweep_row_poses(
     start_theta: float,
     clockwise: bool,
 ) -> tuple[list[SweepPose], CircularSweepRow] | None:
+    if not math.isfinite(sweep_radius) or sweep_radius <= CIRCULAR_GAP_TOLERANCE_M:
+        return None
+
+    local_profile = make_rainbow_profile(profile_config)
+    if not _is_usable_profile_polygon(local_profile):
+        return None
+
     touching_angle = _touching_angular_step(sweep_radius, profile_config)
     target_arc_step = touching_angle * sweep_radius * spacing_factor
-    if target_arc_step <= 0.0:
+    if not math.isfinite(target_arc_step) or target_arc_step <= 0.0:
         return None
     pose_count = max(3, int(math.ceil((2.0 * math.pi * sweep_radius) / target_arc_step)))
-    angular_spacing = 2.0 * math.pi / pose_count
+    if pose_count > CIRCULAR_MAX_PROFILE_COUNT:
+        return None
 
-    profile_area = _polygon_area(make_rainbow_profile(profile_config))
-    gap_arc_length = max(0.0, angular_spacing - touching_angle) * sweep_radius
-    gap_area = gap_arc_length * profile_config.width
-    gap_fraction = gap_area / max(profile_area, 1e-9)
     direction_sign = -1.0 if clockwise else 1.0
     center_x, center_y = tank_center
+    verification: dict[str, float | int | bool] | None = None
     poses: list[SweepPose] = []
 
-    for local_index in range(pose_count):
-        theta = start_theta + direction_sign * 2.0 * math.pi * local_index / pose_count
-        normalized_theta = _normalize_angle(theta)
-        x_m = center_x + sweep_radius * math.cos(theta)
-        y_m = center_y + sweep_radius * math.sin(theta)
-        heading_rad = normalized_theta
-        poses.append(
-            SweepPose(
-                scan_id=scan_id_start + local_index,
-                stage="circular_edge",
-                x_m=float(x_m),
-                y_m=float(y_m),
-                heading_rad=heading_rad,
-                heading_deg=math.degrees(heading_rad),
-                row_id=row_id,
-                row_name=row_name,
-                theta_rad=normalized_theta,
-                sweep_radius_m=sweep_radius,
+    for adjustment_count in range(CIRCULAR_MAX_SPACING_ADJUSTMENTS + 1):
+        if pose_count > CIRCULAR_MAX_PROFILE_COUNT:
+            return None
+        angular_spacing = 2.0 * math.pi / pose_count
+        poses = []
+        for local_index in range(pose_count):
+            theta = start_theta + direction_sign * angular_spacing * local_index
+            normalized_theta = _normalize_angle(theta)
+            x_m = center_x + sweep_radius * math.cos(theta)
+            y_m = center_y + sweep_radius * math.sin(theta)
+            poses.append(
+                SweepPose(
+                    scan_id=scan_id_start + local_index,
+                    stage="circular_edge",
+                    x_m=float(x_m),
+                    y_m=float(y_m),
+                    heading_rad=normalized_theta,
+                    heading_deg=math.degrees(normalized_theta),
+                    row_id=row_id,
+                    row_name=row_name,
+                    theta_rad=normalized_theta,
+                    sweep_radius_m=sweep_radius,
+                )
             )
+
+        world_profiles = [
+            transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+            for pose in poses
+        ]
+        verification = _verify_circular_row_coverage(
+            tank_center,
+            sweep_radius,
+            poses,
+            world_profiles,
+            clockwise=clockwise,
         )
+        if bool(verification["continuous_coverage_verified"]):
+            break
+        pose_count += 1
+    else:
+        return None
+
+    if verification is None or not bool(verification["continuous_coverage_verified"]):
+        return None
+
+    angular_spacing = 2.0 * math.pi / pose_count
     return poses, CircularSweepRow(
         row_id=row_id,
         sweep_radius_m=sweep_radius,
         scan_count=pose_count,
         angular_spacing_rad=angular_spacing,
         arc_spacing_m=sweep_radius * angular_spacing,
-        estimated_gap_area_m2=gap_area,
-        estimated_gap_fraction=gap_fraction,
+        estimated_gap_area_m2=0.0,
+        estimated_gap_fraction=0.0,
+        max_neighbor_gap_distance_m=float(verification["max_neighbor_gap_distance_m"]),
+        minimum_neighbor_contact_passed=bool(verification["minimum_neighbor_contact_passed"]),
+        wraparound_passed=bool(verification["wraparound_passed"]),
+        continuous_coverage_verified=bool(verification["continuous_coverage_verified"]),
+        spacing_adjustments=adjustment_count,
+    )
+
+
+def _verify_circular_row_coverage(
+    tank_center: tuple[float, float],
+    sweep_radius: float,
+    poses: list[SweepPose],
+    world_profiles: list[np.ndarray],
+    *,
+    clockwise: bool,
+) -> dict[str, float | int | bool]:
+    """Verify polygon contact and sampled annular coverage for every neighbor pair."""
+    if len(poses) < 3 or len(poses) != len(world_profiles):
+        return _failed_circular_row_verification()
+    if any(not _is_usable_profile_polygon(profile) for profile in world_profiles):
+        return _failed_circular_row_verification()
+
+    direction_sign = -1.0 if clockwise else 1.0
+    angular_spacing = 2.0 * math.pi / len(poses)
+    max_neighbor_gap = 0.0
+    wraparound_passed = False
+
+    for index, first_profile in enumerate(world_profiles):
+        next_index = (index + 1) % len(world_profiles)
+        second_profile = world_profiles[next_index]
+        neighbor_gap = _polygon_distance(first_profile, second_profile)
+        max_neighbor_gap = max(max_neighbor_gap, neighbor_gap)
+        contact_passed = neighbor_gap <= CIRCULAR_GAP_TOLERANCE_M
+
+        theta_start = float(poses[index].theta_rad or 0.0)
+        band_passed = _circular_pair_covers_test_band(
+            tank_center,
+            sweep_radius,
+            theta_start,
+            direction_sign * angular_spacing,
+            first_profile,
+            second_profile,
+        )
+        pair_passed = contact_passed and band_passed
+        if next_index == 0:
+            wraparound_passed = pair_passed
+        if not pair_passed:
+            return {
+                "max_neighbor_gap_distance_m": max_neighbor_gap,
+                "minimum_neighbor_contact_passed": False,
+                "wraparound_passed": wraparound_passed,
+                "continuous_coverage_verified": False,
+            }
+
+    return {
+        "max_neighbor_gap_distance_m": max_neighbor_gap,
+        "minimum_neighbor_contact_passed": True,
+        "wraparound_passed": wraparound_passed,
+        "continuous_coverage_verified": wraparound_passed,
+    }
+
+
+def _failed_circular_row_verification() -> dict[str, float | int | bool]:
+    return {
+        "max_neighbor_gap_distance_m": math.inf,
+        "minimum_neighbor_contact_passed": False,
+        "wraparound_passed": False,
+        "continuous_coverage_verified": False,
+    }
+
+
+def _circular_pair_covers_test_band(
+    tank_center: tuple[float, float],
+    sweep_radius: float,
+    theta_start: float,
+    theta_step: float,
+    first_profile: np.ndarray,
+    second_profile: np.ndarray,
+) -> bool:
+    """Sample the narrow annular strip between two consecutive scan centers."""
+    angle_fractions = np.linspace(0.0, 1.0, CIRCULAR_TEST_ANGULAR_SAMPLES)
+    angles = theta_start + theta_step * angle_fractions
+    radial_offsets = np.array(
+        [-CIRCULAR_TEST_BAND_HALF_WIDTH_M, 0.0, CIRCULAR_TEST_BAND_HALF_WIDTH_M]
+    )
+    radii = sweep_radius + radial_offsets
+    if np.any(radii <= 0.0):
+        return False
+    grid_radii, grid_angles = np.meshgrid(radii, angles)
+    center_x, center_y = tank_center
+    points = np.column_stack(
+        (
+            center_x + (grid_radii * np.cos(grid_angles)).ravel(),
+            center_y + (grid_radii * np.sin(grid_angles)).ravel(),
+        )
+    )
+    covered = _points_in_or_near_polygon(points, first_profile, CIRCULAR_GAP_TOLERANCE_M)
+    covered |= _points_in_or_near_polygon(points, second_profile, CIRCULAR_GAP_TOLERANCE_M)
+    return bool(np.all(covered))
+
+
+def _is_usable_profile_polygon(polygon: np.ndarray) -> bool:
+    return (
+        polygon.ndim == 2
+        and polygon.shape[1] == 2
+        and len(polygon) >= 3
+        and bool(np.all(np.isfinite(polygon)))
+        and _polygon_area(polygon) > 1e-9
     )
 
 
@@ -268,7 +427,7 @@ def _generate_circular_sweep_plan(
     poses: list[SweepPose] = []
     start_theta = 0.0
 
-    while current_radius > profile_config.width / 2.0:
+    while current_radius > profile_config.width / 2.0 and len(rows) < DEFAULT_MAX_CIRCULAR_ROWS:
         generated = _generate_sweep_row_poses(
             tank_center,
             current_radius,
@@ -281,7 +440,13 @@ def _generate_circular_sweep_plan(
             clockwise=clockwise,
         )
         if generated is None:
-            return _apply_circular_stop_backoff(rows, poses, current_radius, "overlap", circular_stop_backoff_rows)
+            return _apply_circular_stop_backoff(
+                rows,
+                poses,
+                current_radius,
+                "continuous_coverage_failed",
+                circular_stop_backoff_rows,
+            )
 
         row_poses, row = generated
         if row.estimated_gap_fraction > max_circular_gap_fraction:
@@ -292,7 +457,65 @@ def _generate_circular_sweep_plan(
         start_theta = row_poses[-1].theta_rad
         current_radius -= row_spacing_m
 
+    if len(rows) >= DEFAULT_MAX_CIRCULAR_ROWS:
+        return CircularSweepPlan(rows, poses, current_radius, "max_circular_rows")
+
     return _apply_circular_stop_backoff(rows, poses, current_radius, "radius", circular_stop_backoff_rows)
+
+
+def _generate_fixed_circular_sweep_plan(
+    tank_center: tuple[float, float],
+    tank_radius: float,
+    *,
+    outer_edge_offset_m: float,
+    row_spacing_m: float,
+    spacing_factor: float,
+    fixed_circular_rows: int,
+    max_circular_gap_fraction: float,
+    profile_config: RainbowProfileConfig | None,
+    clockwise: bool,
+) -> CircularSweepPlan:
+    """Generate exactly the requested number of circular rows, capped by the planner max."""
+    if fixed_circular_rows < 0:
+        raise ValueError("Fixed circular row count must be zero or greater.")
+    if fixed_circular_rows > DEFAULT_MAX_CIRCULAR_ROWS:
+        raise ValueError(f"Fixed circular row count cannot exceed {DEFAULT_MAX_CIRCULAR_ROWS}.")
+    if fixed_circular_rows == 0:
+        return CircularSweepPlan([], [], None, "fixed_row_count")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    current_radius = _profile_constrained_sweep_radius(tank_radius, profile_config, outer_edge_offset_m)
+    rows: list[CircularSweepRow] = []
+    poses: list[SweepPose] = []
+    start_theta = 0.0
+
+    for row_id in range(fixed_circular_rows):
+        if current_radius <= profile_config.width / 2.0:
+            return CircularSweepPlan(rows, poses, current_radius, "radius")
+        generated = _generate_sweep_row_poses(
+            tank_center,
+            current_radius,
+            profile_config=profile_config,
+            spacing_factor=spacing_factor,
+            row_id=row_id,
+            row_name=f"circular_{row_id}",
+            scan_id_start=len(poses),
+            start_theta=start_theta,
+            clockwise=clockwise,
+        )
+        if generated is None:
+            return CircularSweepPlan(rows, poses, current_radius, "continuous_coverage_failed")
+
+        row_poses, row = generated
+        if row.estimated_gap_fraction > max_circular_gap_fraction:
+            return CircularSweepPlan(rows, poses, current_radius, "gap")
+
+        rows.append(row)
+        poses.extend(row_poses)
+        start_theta = row_poses[-1].theta_rad
+        current_radius -= row_spacing_m
+
+    return CircularSweepPlan(rows, poses, None, "fixed_row_count")
 
 
 def _apply_circular_stop_backoff(
@@ -327,6 +550,7 @@ def build_outer_edge_sweep_mission(
     outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
     row_spacing_m: float = DEFAULT_ROW_SPACING,
     spacing_factor: float = DEFAULT_SPACING_FACTOR,
+    fixed_circular_rows: int | None = None,
     max_circular_gap_fraction: float = DEFAULT_MAX_CIRCULAR_GAP_FRACTION,
     circular_stop_backoff_rows: int = DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS,
     profile_config: RainbowProfileConfig | None = None,
@@ -335,17 +559,30 @@ def build_outer_edge_sweep_mission(
     """Build metadata and accepted circular edge rows from imported geometry."""
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     tank = estimate_tank_circle_from_geometry(model)
-    circular_plan = _generate_circular_sweep_plan(
-        (tank.center_x, tank.center_y),
-        tank.radius,
-        outer_edge_offset_m=outer_edge_offset_m,
-        row_spacing_m=row_spacing_m,
-        spacing_factor=spacing_factor,
-        max_circular_gap_fraction=max_circular_gap_fraction,
-        circular_stop_backoff_rows=circular_stop_backoff_rows,
-        profile_config=profile_config,
-        clockwise=clockwise,
-    )
+    if fixed_circular_rows is None:
+        circular_plan = _generate_circular_sweep_plan(
+            (tank.center_x, tank.center_y),
+            tank.radius,
+            outer_edge_offset_m=outer_edge_offset_m,
+            row_spacing_m=row_spacing_m,
+            spacing_factor=spacing_factor,
+            max_circular_gap_fraction=max_circular_gap_fraction,
+            circular_stop_backoff_rows=circular_stop_backoff_rows,
+            profile_config=profile_config,
+            clockwise=clockwise,
+        )
+    else:
+        circular_plan = _generate_fixed_circular_sweep_plan(
+            (tank.center_x, tank.center_y),
+            tank.radius,
+            outer_edge_offset_m=outer_edge_offset_m,
+            row_spacing_m=row_spacing_m,
+            spacing_factor=spacing_factor,
+            fixed_circular_rows=fixed_circular_rows,
+            max_circular_gap_fraction=max_circular_gap_fraction,
+            profile_config=profile_config,
+            clockwise=clockwise,
+        )
     profile_radial_half_width = profile_config.width / 2.0
     profile_tangential_span = _profile_tangential_span(profile_config)
     profile_wall_contact_span = profile_config.side_height
@@ -397,6 +634,7 @@ def _build_mission_plan_once(
     outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
     row_spacing_m: float = DEFAULT_ROW_SPACING,
     spacing_factor: float = DEFAULT_SPACING_FACTOR,
+    fixed_circular_rows: int | None = None,
     max_circular_gap_fraction: float = DEFAULT_MAX_CIRCULAR_GAP_FRACTION,
     circular_stop_backoff_rows: int = DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS,
     vertical_spacing_factor: float = DEFAULT_VERTICAL_SPACING_FACTOR,
@@ -417,6 +655,7 @@ def _build_mission_plan_once(
         outer_edge_offset_m=outer_edge_offset_m,
         row_spacing_m=row_spacing_m,
         spacing_factor=spacing_factor,
+        fixed_circular_rows=fixed_circular_rows,
         max_circular_gap_fraction=max_circular_gap_fraction,
         circular_stop_backoff_rows=circular_stop_backoff_rows,
         profile_config=profile_config,
@@ -486,42 +725,55 @@ def build_mission_plan(
             clockwise=clockwise,
         )
 
-    candidate_missions: list[tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]] = []
-    for candidate_factor in circular_spacing_candidates:
-        if candidate_factor < 0.80:
-            continue
-        mission = _build_mission_plan_once(
-            model,
-            outer_edge_offset_m=outer_edge_offset_m,
-            row_spacing_m=row_spacing_m,
-            spacing_factor=candidate_factor,
-            max_circular_gap_fraction=max_circular_gap_fraction,
-            circular_stop_backoff_rows=circular_stop_backoff_rows,
-            vertical_spacing_factor=vertical_spacing_factor,
-            overlap_discard_threshold=overlap_discard_threshold,
-            interior_enabled=interior_enabled,
-            profile_config=profile_config,
-            clockwise=clockwise,
-        )
-        coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
-        travel_distance = _estimate_mission_travel_distance(mission.poses)
-        candidate_missions.append((candidate_factor, mission, coverage, travel_distance))
+    candidate_missions: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]] = []
+    for row_count in range(DEFAULT_MAX_CIRCULAR_ROWS + 1):
+        row_spacing_factors: tuple[float | None, ...] = (None,) if row_count == 0 else circular_spacing_candidates
+        for candidate_factor in row_spacing_factors:
+            if candidate_factor is not None and candidate_factor < 0.80:
+                continue
+            try:
+                mission = _build_mission_plan_once(
+                    model,
+                    outer_edge_offset_m=outer_edge_offset_m,
+                    row_spacing_m=row_spacing_m,
+                    spacing_factor=spacing_factor if candidate_factor is None else candidate_factor,
+                    fixed_circular_rows=row_count,
+                    max_circular_gap_fraction=max_circular_gap_fraction,
+                    circular_stop_backoff_rows=circular_stop_backoff_rows,
+                    vertical_spacing_factor=vertical_spacing_factor,
+                    overlap_discard_threshold=overlap_discard_threshold,
+                    interior_enabled=interior_enabled,
+                    profile_config=profile_config,
+                    clockwise=clockwise,
+                )
+            except ValueError:
+                continue
+            if len(mission.circular_rows) != row_count:
+                continue
+            coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
+            travel_distance = _estimate_mission_travel_distance(mission.poses)
+            candidate_missions.append((row_count, candidate_factor, mission, coverage, travel_distance))
 
     if not candidate_missions:
         raise ValueError("No valid circular spacing candidates were provided.")
 
     selected = _select_circular_spacing_candidate(candidate_missions)
 
-    selected_factor, selected_mission, _selected_coverage, _selected_travel = selected
+    selected_rows, selected_factor, selected_mission, _selected_coverage, _selected_travel = selected
     candidate_records = [
         CircularSpacingCandidate(
+            circular_rows=row_count,
             spacing_factor=factor,
             coverage_percent=coverage.covered_percent,
             scan_count=len(mission.poses),
             travel_distance_m=travel_distance,
-            selected=math.isclose(factor, selected_factor),
+            selected=row_count == selected_rows
+            and (
+                (factor is None and selected_factor is None)
+                or (factor is not None and selected_factor is not None and math.isclose(factor, selected_factor))
+            ),
         )
-        for factor, mission, coverage, travel_distance in candidate_missions
+        for row_count, factor, mission, coverage, travel_distance in candidate_missions
     ]
     return replace(
         selected_mission,
@@ -533,30 +785,54 @@ def build_mission_plan(
 
 
 def _select_circular_spacing_candidate(
-    candidates: list[tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]],
-) -> tuple[float, OuterEdgeSweepMission, CoverageEstimate, float]:
+    candidates: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]],
+) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
     target_candidates = [
-        candidate for candidate in candidates if candidate[2].covered_percent >= TARGET_COVERAGE_PERCENT
+        candidate for candidate in candidates if candidate[3].covered_percent >= TARGET_COVERAGE_PERCENT
     ]
-    if target_candidates:
-        return min(
-            target_candidates,
-            key=lambda candidate: (
-                len(candidate[1].poses),
-                candidate[3],
-                -candidate[0],
-            ),
-        )
+    search_pool = target_candidates if target_candidates else candidates
+    selected = search_pool[0]
+    for candidate in search_pool[1:]:
+        selected = _choose_better_strategy_candidate(selected, candidate, using_target_pool=bool(target_candidates))
+    return selected
 
-    return max(
-        candidates,
-        key=lambda candidate: (
-            candidate[2].covered_percent,
-            -len(candidate[1].poses),
-            -candidate[3],
-            candidate[0],
-        ),
+
+def _choose_better_strategy_candidate(
+    current: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
+    candidate: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
+    *,
+    using_target_pool: bool,
+) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
+    current_rows, current_factor, current_mission, current_coverage, current_travel = current
+    candidate_rows, candidate_factor, candidate_mission, candidate_coverage, candidate_travel = candidate
+
+    if not using_target_pool:
+        coverage_delta = candidate_coverage.covered_percent - current_coverage.covered_percent
+        if coverage_delta > 0.5:
+            return candidate
+        if coverage_delta < -0.5:
+            return current
+
+    coverage_gain = candidate_coverage.covered_percent - current_coverage.covered_percent
+    scan_savings = len(current_mission.poses) - len(candidate_mission.poses)
+    if coverage_gain > 0.5 and scan_savings > 0:
+        return candidate
+    if coverage_gain < -0.5 and scan_savings < 0:
+        return current
+
+    candidate_key = (
+        candidate_travel,
+        len(candidate_mission.poses),
+        candidate_rows,
+        -(candidate_factor if candidate_factor is not None else 1.0),
     )
+    current_key = (
+        current_travel,
+        len(current_mission.poses),
+        current_rows,
+        -(current_factor if current_factor is not None else 1.0),
+    )
+    return candidate if candidate_key < current_key else current
 
 
 def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate]) -> str | None:
@@ -565,10 +841,10 @@ def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate
         return None
     if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
         return (
-            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying spacing"
+            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row/spacing strategy"
         )
     return (
-        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available coverage "
+        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row/spacing coverage "
         "without going below the allowed overlap limit"
     )
 
@@ -1120,7 +1396,14 @@ def print_mission_summary(
     for row in mission.circular_rows:
         print(
             f"  Row {row.row_id + 1}: radius={row.sweep_radius_m:.6g} m, scans={row.scan_count}, "
-            f"gap_fraction={row.estimated_gap_fraction:.6g}"
+            f"angular_spacing={math.degrees(row.angular_spacing_rad):.3f} deg, "
+            f"arc_spacing={row.arc_spacing_m:.4f} m, adjustments={row.spacing_adjustments}"
+        )
+        print(
+            f"    max_neighbor_gap={row.max_neighbor_gap_distance_m:.6g} m, "
+            f"neighbor_contact={'pass' if row.minimum_neighbor_contact_passed else 'fail'}, "
+            f"wraparound={'pass' if row.wraparound_passed else 'fail'}, "
+            f"continuous_coverage={'verified' if row.continuous_coverage_verified else 'failed'}"
         )
     if mission.rejected_circular_radius_m is not None:
         print(f"Circular stop radius: {mission.rejected_circular_radius_m:.6g} m")
@@ -1136,11 +1419,13 @@ def print_mission_summary(
     print(f"Total mission scans: {len(mission.poses)}")
     if mission.circular_spacing_candidates:
         print("Circular spacing comparison")
-        print("circular_spacing | coverage_% | scans | travel_m")
+        print("rows | circular_spacing | coverage_% | scans | travel_m")
         for candidate in mission.circular_spacing_candidates:
             selected_marker = "  <-- selected" if candidate.selected else ""
+            spacing_text = "n/a" if candidate.spacing_factor is None else f"{candidate.spacing_factor:.2f}"
             print(
-                f"{candidate.spacing_factor:<16.2f} | "
+                f"{candidate.circular_rows:<4d} | "
+                f"{spacing_text:<16} | "
                 f"{candidate.coverage_percent:<10.1f} | "
                 f"{candidate.scan_count:<5d} | "
                 f"{candidate.travel_distance_m:<8.1f}"
@@ -1322,6 +1607,59 @@ def _polygons_overlap_or_touch(first: np.ndarray, second: np.ndarray, tolerance:
                 return True
 
     return _point_in_polygon(first_polygon[0], second_polygon) or _point_in_polygon(second_polygon[0], first_polygon)
+
+
+def _polygon_distance(first: np.ndarray, second: np.ndarray) -> float:
+    """Return zero for intersecting polygons, otherwise their nearest boundary distance."""
+    if _polygons_overlap_or_touch(first, second, tolerance=CIRCULAR_GAP_TOLERANCE_M):
+        return 0.0
+
+    first_polygon = _without_duplicate_closure(first)
+    second_polygon = _without_duplicate_closure(second)
+    minimum_distance = math.inf
+    for point in first_polygon:
+        minimum_distance = min(minimum_distance, _point_to_polygon_boundary_distance(point, second_polygon))
+    for point in second_polygon:
+        minimum_distance = min(minimum_distance, _point_to_polygon_boundary_distance(point, first_polygon))
+    return float(minimum_distance)
+
+
+def _point_to_polygon_boundary_distance(point: np.ndarray, polygon: np.ndarray) -> float:
+    starts = polygon
+    ends = np.roll(polygon, -1, axis=0)
+    segments = ends - starts
+    lengths_squared = np.sum(segments * segments, axis=1)
+    projections = np.zeros(len(segments), dtype=float)
+    usable = lengths_squared > 1e-20
+    projections[usable] = np.sum((point - starts[usable]) * segments[usable], axis=1) / lengths_squared[usable]
+    projections = np.clip(projections, 0.0, 1.0)
+    closest = starts + projections[:, None] * segments
+    return float(np.min(np.linalg.norm(closest - point, axis=1)))
+
+
+def _points_in_or_near_polygon(points: np.ndarray, polygon: np.ndarray, tolerance: float) -> np.ndarray:
+    """Include points inside a polygon or within tolerance of its boundary."""
+    covered = _points_in_polygon(points, polygon)
+    if np.all(covered):
+        return covered
+
+    polygon = _without_duplicate_closure(polygon)
+    uncovered_indices = np.flatnonzero(~covered)
+    uncovered_points = points[uncovered_indices]
+    minimum_distances = np.full(len(uncovered_points), math.inf, dtype=float)
+    for start, end in zip(polygon, np.roll(polygon, -1, axis=0)):
+        segment = end - start
+        length_squared = float(np.dot(segment, segment))
+        if length_squared <= 1e-20:
+            distances = np.linalg.norm(uncovered_points - start, axis=1)
+        else:
+            projections = np.sum((uncovered_points - start) * segment, axis=1) / length_squared
+            projections = np.clip(projections, 0.0, 1.0)
+            closest = start + projections[:, None] * segment
+            distances = np.linalg.norm(uncovered_points - closest, axis=1)
+        minimum_distances = np.minimum(minimum_distances, distances)
+    covered[uncovered_indices] = minimum_distances <= tolerance
+    return covered
 
 
 def _segments_intersect(
