@@ -10,6 +10,14 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from observation_region import (
+    ScanFootprintRegion,
+    build_observed_region_from_mission_json,
+    build_observed_region_from_scan_poses,
+    clip_segment_to_observed_region,
+)
+from scan_profile import RainbowProfileConfig
+
 
 ORIENTATIONS = ("vertical", "horizontal", "diagonal")
 
@@ -29,6 +37,8 @@ class TankGeometry:
 
 @dataclass(frozen=True)
 class ObservationRegion:
+    """Deprecated annulus metadata retained for test compatibility only."""
+
     kind: str = "unknown"
     inner_radius_fraction: float | None = None
     outer_radius_fraction: float = 1.0
@@ -60,7 +70,7 @@ class ObservedTankGeometry:
     tank: TankGeometry
     segments: list[ObservedSegment]
     arcs: list[ObservedArc] = field(default_factory=list)
-    observation_region: ObservationRegion | None = None
+    observation_region: ObservationRegion | ScanFootprintRegion | None = None
     units: str = "m"
     source_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -137,6 +147,7 @@ class _NormalizedSegment:
     orientation: str
     confidence: float
     source_id: str
+    source: str = "observed"
 
     @property
     def length(self) -> float:
@@ -215,6 +226,64 @@ def observed_geometry_from_dxf(
         units=units,
         source_metadata={"source_type": "dxf", "source_path": source_path},
     )
+
+
+def clip_geometry_to_observed_region(
+    full_geometry: ObservedTankGeometry,
+    observed_region: ScanFootprintRegion,
+) -> ObservedTankGeometry:
+    """Expose only weld fragments covered by actual circular scan footprints."""
+    clipped_segments: list[ObservedSegment] = []
+    for segment in full_geometry.segments:
+        pieces = clip_segment_to_observed_region(
+            (segment.start.x, segment.start.y),
+            (segment.end.x, segment.end.y),
+            observed_region,
+        )
+        for piece_index, (start, end) in enumerate(pieces):
+            clipped_segments.append(
+                ObservedSegment(
+                    start=LayoutPoint(float(start[0]), float(start[1])),
+                    end=LayoutPoint(float(end[0]), float(end[1])),
+                    source="observed_circular_scan",
+                    confidence=segment.confidence,
+                    source_id=f"{segment.source_id or 'segment'}:circular_scan:{piece_index}",
+                    metadata={
+                        **segment.metadata,
+                        "original_source": segment.source,
+                        "observation_source": "circular_scan_footprint_union",
+                    },
+                )
+            )
+    profile = observed_region.profile_config
+    return ObservedTankGeometry(
+        tank=full_geometry.tank,
+        segments=clipped_segments,
+        arcs=[],
+        observation_region=observed_region,
+        units=full_geometry.units,
+        source_metadata={
+            **full_geometry.source_metadata,
+            "observation_method": "circular_scan_footprint_union",
+            "circular_scan_pose_count": observed_region.circular_pose_count,
+            "scan_profile": {
+                "width_m": profile.width,
+                "arc_radius_m": profile.arc_radius,
+                "side_height_m": profile.side_height,
+                "arc_samples": profile.arc_samples,
+            },
+        },
+    )
+
+
+def observed_geometry_from_circular_sweeps(
+    full_geometry: ObservedTankGeometry,
+    circular_scan_poses: Iterable[Any],
+    scan_profile: RainbowProfileConfig | np.ndarray | None = None,
+) -> tuple[ObservedTankGeometry, ScanFootprintRegion]:
+    """Build actual scan footprints and clip generic geometry to their union."""
+    observed_region = build_observed_region_from_scan_poses(circular_scan_poses, scan_profile)
+    return clip_geometry_to_observed_region(full_geometry, observed_region), observed_region
 
 
 def predict_tank_layout(
@@ -508,6 +577,8 @@ def export_layout_dxf(layout: CompletedTankLayout, filepath: str | Path) -> Path
 def plot_predicted_layout(
     layout: CompletedTankLayout,
     *,
+    observed_region: ScanFootprintRegion | None = None,
+    hidden_ground_truth: ObservedTankGeometry | None = None,
     show: bool = True,
     save_path: str | Path | None = None,
 ) -> Any:
@@ -518,6 +589,22 @@ def plot_predicted_layout(
     fig, ax = plt.subplots(figsize=(9, 9))
     tank = layout.tank_boundary
     ax.add_patch(Circle((tank.center_x, tank.center_y), tank.radius, fill=False, color="#111827", linewidth=2.0))
+    if observed_region is not None:
+        for polygon in observed_region.polygons:
+            closed = np.vstack((polygon, polygon[0])) if not np.allclose(polygon[0], polygon[-1]) else polygon
+            ax.fill(closed[:, 0], closed[:, 1], color="#60a5fa", alpha=0.025, zorder=0)
+            ax.plot(closed[:, 0], closed[:, 1], color="#2563eb", linewidth=0.35, alpha=0.18, zorder=1)
+    if hidden_ground_truth is not None:
+        for segment in hidden_ground_truth.segments:
+            ax.plot(
+                [segment.start.x, segment.end.x],
+                [segment.start.y, segment.end.y],
+                color="#9ca3af",
+                linewidth=0.7,
+                linestyle=":",
+                alpha=0.45,
+                zorder=1,
+            )
     for segment in layout.observed_weld_segments:
         ax.plot(
             [segment.start.x, segment.end.x],
@@ -553,6 +640,10 @@ def plot_predicted_layout(
         Line2D([], [], color="#d97706", linestyle="--", label="Medium confidence"),
         Line2D([], [], color="#dc2626", linestyle="--", label="Low confidence"),
     ]
+    if observed_region is not None:
+        handles.insert(0, Line2D([], [], color="#2563eb", alpha=0.45, label="Circular scan footprints"))
+    if hidden_ground_truth is not None:
+        handles.append(Line2D([], [], color="#9ca3af", linestyle=":", label="Hidden validation geometry"))
     ax.legend(handles=handles, loc="upper right")
     plt.tight_layout()
     if save_path is not None:
@@ -600,6 +691,7 @@ def _normalize_and_classify(
                 orientation=_classify_orientation(start, end, config.angle_tolerance_deg),
                 confidence=min(1.0, max(0.0, float(segment.confidence))),
                 source_id=segment.source_id or f"segment:{index}",
+                source=segment.source,
             )
         )
     return normalized
@@ -671,6 +763,7 @@ def _axis_segment(
         orientation,
         float(np.mean([segment.confidence for segment in support])),
         ",".join(segment.source_id for segment in support[:12]),
+        support[0].source,
     )
 
 
@@ -1001,7 +1094,7 @@ def _observed_layout_segment(segment: _NormalizedSegment, tank: TankGeometry) ->
     return LayoutSegment(
         _world_point(segment.start, tank),
         _world_point(segment.end, tank),
-        "observed",
+        segment.source,
         segment.confidence,
         _confidence_level(segment.confidence),
         segment.orientation,
@@ -1043,6 +1136,7 @@ def _layout_to_normalized(segment: LayoutSegment, tank: TankGeometry) -> _Normal
         segment.orientation,
         segment.confidence,
         ",".join(segment.supporting_observations),
+        segment.source,
     )
 
 
@@ -1167,9 +1261,18 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict missing tank plate and weld geometry from partial observations.")
     parser.add_argument("dxf_path", help="DXF used as an observation source.")
     parser.add_argument(
+        "--mission-json",
+        help="Preferred observation source: use only geometry covered by circular poses in this mission JSON.",
+    )
+    parser.add_argument(
         "--observation-inner-fraction",
         type=float,
-        help="Mask input to an outer annulus before prediction, for validation or simulation.",
+        help="Deprecated test-only annulus approximation; ignored when --mission-json is supplied.",
+    )
+    parser.add_argument(
+        "--show-hidden-ground-truth",
+        action="store_true",
+        help="Show complete DXF welds as a separate dotted validation layer.",
     )
     parser.add_argument("--save-json", default="predicted_tank_layout.json")
     parser.add_argument("--save-dxf", default="predicted_tank_layout.dxf")
@@ -1184,13 +1287,28 @@ def main() -> int:
 
     try:
         model = import_dxf(args.dxf_path)
-        observations = observed_geometry_from_dxf(model)
-        if args.observation_inner_fraction is not None:
-            observations = mask_observations_to_annulus(observations, args.observation_inner_fraction)
+        full_geometry = observed_geometry_from_dxf(model)
+        observed_region = None
+        if args.mission_json:
+            observed_region = build_observed_region_from_mission_json(args.mission_json)
+            observations = clip_geometry_to_observed_region(full_geometry, observed_region)
+            if args.observation_inner_fraction is not None:
+                print("Warning: --observation-inner-fraction is ignored when --mission-json is supplied.")
+        elif args.observation_inner_fraction is not None:
+            print("Warning: --observation-inner-fraction is deprecated and intended only for legacy tests.")
+            observations = mask_observations_to_annulus(full_geometry, args.observation_inner_fraction)
+        else:
+            observations = full_geometry
         layout = predict_tank_layout(observations)
         json_path = save_layout_json(layout, args.save_json)
         dxf_path = export_layout_dxf(layout, args.save_dxf)
-        plot_predicted_layout(layout, show=not args.no_plot, save_path=args.save_plot)
+        plot_predicted_layout(
+            layout,
+            observed_region=observed_region,
+            hidden_ground_truth=full_geometry if args.show_hidden_ground_truth else None,
+            show=not args.no_plot,
+            save_path=args.save_plot,
+        )
     except (DxfImportError, RuntimeError, ValueError) as exc:
         print(f"Tank layout prediction failed: {exc}")
         return 1

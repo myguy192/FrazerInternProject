@@ -17,11 +17,16 @@ from scan_profile import RainbowProfileConfig, make_rainbow_profile, transform_p
 DEFAULT_EDGE_OFFSET_FROM_WALL = 0.0
 DEFAULT_ROW_SPACING = 1.60
 DEFAULT_SPACING_FACTOR = 1.0
-DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.00, 0.95, 0.90, 0.85, 0.80)
+# Retained for strategy-search API compatibility; profile density is now chosen
+# directly from measured neighboring-polygon overlap.
+DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.0,)
 DEFAULT_MAX_CIRCULAR_ROWS = 2
 TARGET_COVERAGE_PERCENT = 95.0
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
+DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.04
+MIN_CIRCULAR_OVERLAP_FRACTION = 0.01
+MAX_CIRCULAR_OVERLAP_FRACTION = 0.04
 DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
 DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
@@ -35,7 +40,9 @@ OVERLAP_SAMPLE_GRID_SIZE = 28
 CIRCULAR_GAP_TOLERANCE_M = 0.002
 CIRCULAR_TEST_BAND_HALF_WIDTH_M = 0.005
 CIRCULAR_TEST_ANGULAR_SAMPLES = 17
-CIRCULAR_MAX_SPACING_ADJUSTMENTS = 256
+CIRCULAR_PROFILE_COUNT_SEARCH_RADIUS = 32
+CIRCULAR_OVERLAP_TIE_FRACTION = 0.0025
+CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE = 48
 CIRCULAR_MAX_PROFILE_COUNT = 10000
 _TOUCHING_ANGULAR_STEP_CACHE: dict[tuple[float, float, float, float, int], float] = {}
 
@@ -89,6 +96,12 @@ class CircularSweepRow:
     wraparound_passed: bool
     continuous_coverage_verified: bool
     spacing_adjustments: int
+    target_neighbor_overlap_fraction: float
+    minimum_neighbor_overlap_fraction: float
+    average_neighbor_overlap_fraction: float
+    maximum_neighbor_overlap_fraction: float
+    wraparound_overlap_fraction: float
+    no_neighbor_gaps_verified: bool
 
 
 @dataclass(frozen=True)
@@ -170,11 +183,27 @@ def estimate_tank_circle_from_geometry(model: GeometryModel) -> TankCircleEstima
     )
 
 
-def predict_tank_layout_from_geometry(model: GeometryModel, config: Any | None = None) -> Any:
+def predict_tank_layout_from_geometry(
+    model: GeometryModel,
+    config: Any | None = None,
+    *,
+    circular_scan_poses: Any | None = None,
+    scan_profile: Any | None = None,
+) -> Any:
     """Explicit opt-in bridge from imported geometry to the standalone layout predictor."""
-    from tank_layout_predictor import observed_geometry_from_dxf, predict_tank_layout
+    from tank_layout_predictor import (
+        observed_geometry_from_circular_sweeps,
+        observed_geometry_from_dxf,
+        predict_tank_layout,
+    )
 
     observations = observed_geometry_from_dxf(model)
+    if circular_scan_poses is not None:
+        observations, _ = observed_geometry_from_circular_sweeps(
+            observations,
+            circular_scan_poses,
+            scan_profile,
+        )
     return predict_tank_layout(observations, config=config)
 
 
@@ -215,32 +244,46 @@ def _generate_sweep_row_poses(
     scan_id_start: int,
     start_theta: float,
     clockwise: bool,
+    target_overlap_fraction: float = DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION,
 ) -> tuple[list[SweepPose], CircularSweepRow] | None:
     if not math.isfinite(sweep_radius) or sweep_radius <= CIRCULAR_GAP_TOLERANCE_M:
         return None
+    if not MIN_CIRCULAR_OVERLAP_FRACTION <= target_overlap_fraction <= MAX_CIRCULAR_OVERLAP_FRACTION:
+        raise ValueError(
+            "Circular neighbor overlap target must be between "
+            f"{MIN_CIRCULAR_OVERLAP_FRACTION:.3f} and {MAX_CIRCULAR_OVERLAP_FRACTION:.3f}."
+        )
 
     local_profile = make_rainbow_profile(profile_config)
     if not _is_usable_profile_polygon(local_profile):
         return None
 
     touching_angle = _touching_angular_step(sweep_radius, profile_config)
-    target_arc_step = touching_angle * sweep_radius * spacing_factor
-    if not math.isfinite(target_arc_step) or target_arc_step <= 0.0:
+    if not math.isfinite(touching_angle) or touching_angle <= 0.0:
         return None
-    pose_count = max(3, int(math.ceil((2.0 * math.pi * sweep_radius) / target_arc_step)))
-    if pose_count > CIRCULAR_MAX_PROFILE_COUNT:
+    initial_pose_count = max(3, int(math.ceil((2.0 * math.pi) / touching_angle)))
+    if initial_pose_count > CIRCULAR_MAX_PROFILE_COUNT:
         return None
 
+    # spacing_factor is retained in the public API for compatibility, but it
+    # no longer controls circular density. Actual polygon overlap does.
+    _ = spacing_factor
     direction_sign = -1.0 if clockwise else 1.0
     center_x, center_y = tank_center
-    verification: dict[str, float | int | bool] | None = None
-    poses: list[SweepPose] = []
+    candidate_counts = _ranked_circular_profile_counts(
+        sweep_radius,
+        local_profile,
+        initial_pose_count,
+        clockwise=clockwise,
+        target_overlap_fraction=target_overlap_fraction,
+    )
+    if not candidate_counts:
+        return None
 
-    for adjustment_count in range(CIRCULAR_MAX_SPACING_ADJUSTMENTS + 1):
-        if pose_count > CIRCULAR_MAX_PROFILE_COUNT:
-            return None
+    selected: tuple[list[SweepPose], int, dict[str, float | int | bool]] | None = None
+    for pose_count in candidate_counts:
         angular_spacing = 2.0 * math.pi / pose_count
-        poses = []
+        poses: list[SweepPose] = []
         for local_index in range(pose_count):
             theta = start_theta + direction_sign * angular_spacing * local_index
             normalized_theta = _normalize_angle(theta)
@@ -270,17 +313,17 @@ def _generate_sweep_row_poses(
             sweep_radius,
             poses,
             world_profiles,
+            local_profile=local_profile,
             clockwise=clockwise,
+            minimum_overlap_fraction=MIN_CIRCULAR_OVERLAP_FRACTION,
         )
         if bool(verification["continuous_coverage_verified"]):
+            selected = (poses, pose_count, verification)
             break
-        pose_count += 1
-    else:
+    if selected is None:
         return None
 
-    if verification is None or not bool(verification["continuous_coverage_verified"]):
-        return None
-
+    poses, pose_count, verification = selected
     angular_spacing = 2.0 * math.pi / pose_count
     return poses, CircularSweepRow(
         row_id=row_id,
@@ -294,8 +337,70 @@ def _generate_sweep_row_poses(
         minimum_neighbor_contact_passed=bool(verification["minimum_neighbor_contact_passed"]),
         wraparound_passed=bool(verification["wraparound_passed"]),
         continuous_coverage_verified=bool(verification["continuous_coverage_verified"]),
-        spacing_adjustments=adjustment_count,
+        spacing_adjustments=abs(pose_count - initial_pose_count),
+        target_neighbor_overlap_fraction=target_overlap_fraction,
+        minimum_neighbor_overlap_fraction=float(verification["minimum_neighbor_overlap_fraction"]),
+        average_neighbor_overlap_fraction=float(verification["average_neighbor_overlap_fraction"]),
+        maximum_neighbor_overlap_fraction=float(verification["maximum_neighbor_overlap_fraction"]),
+        wraparound_overlap_fraction=float(verification["wraparound_overlap_fraction"]),
+        no_neighbor_gaps_verified=bool(verification["no_neighbor_gaps_verified"]),
     )
+
+
+def _ranked_circular_profile_counts(
+    sweep_radius: float,
+    local_profile: np.ndarray,
+    initial_pose_count: int,
+    *,
+    clockwise: bool,
+    target_overlap_fraction: float,
+) -> list[int]:
+    """Rank a small set of integer counts by measured neighboring overlap."""
+    lower = max(3, initial_pose_count - CIRCULAR_PROFILE_COUNT_SEARCH_RADIUS)
+    upper = min(CIRCULAR_MAX_PROFILE_COUNT, initial_pose_count + CIRCULAR_PROFILE_COUNT_SEARCH_RADIUS)
+    direction_sign = -1.0 if clockwise else 1.0
+    first_profile = transform_profile(local_profile, sweep_radius, 0.0, 0.0)
+    local_samples = _profile_interior_sample_points(local_profile)
+    first_samples = transform_profile(local_samples, sweep_radius, 0.0, 0.0)
+    candidates: list[tuple[int, float]] = []
+
+    for pose_count in range(lower, upper + 1):
+        angular_spacing = direction_sign * 2.0 * math.pi / pose_count
+        second_profile = transform_profile(
+            local_profile,
+            sweep_radius * math.cos(angular_spacing),
+            sweep_radius * math.sin(angular_spacing),
+            _normalize_angle(angular_spacing),
+        )
+        second_samples = transform_profile(
+            local_samples,
+            sweep_radius * math.cos(angular_spacing),
+            sweep_radius * math.sin(angular_spacing),
+            _normalize_angle(angular_spacing),
+        )
+        if not _is_usable_profile_polygon(second_profile):
+            continue
+        overlap_fraction = _estimate_neighbor_overlap_fraction(
+            first_profile,
+            second_profile,
+            first_sample_points=first_samples,
+            second_sample_points=second_samples,
+        )
+        if overlap_fraction >= MIN_CIRCULAR_OVERLAP_FRACTION:
+            candidates.append((pose_count, overlap_fraction))
+
+    if not candidates:
+        return []
+    best_delta = min(abs(overlap - target_overlap_fraction) for _, overlap in candidates)
+    effectively_tied = [
+        item
+        for item in candidates
+        if abs(item[1] - target_overlap_fraction) <= best_delta + CIRCULAR_OVERLAP_TIE_FRACTION
+    ]
+    effectively_tied.sort(key=lambda item: item[0])
+    remaining = [item for item in candidates if item not in effectively_tied]
+    remaining.sort(key=lambda item: (abs(item[1] - target_overlap_fraction), item[0]))
+    return [pose_count for pose_count, _overlap in effectively_tied + remaining]
 
 
 def _verify_circular_row_coverage(
@@ -304,9 +409,11 @@ def _verify_circular_row_coverage(
     poses: list[SweepPose],
     world_profiles: list[np.ndarray],
     *,
+    local_profile: np.ndarray,
     clockwise: bool,
+    minimum_overlap_fraction: float = MIN_CIRCULAR_OVERLAP_FRACTION,
 ) -> dict[str, float | int | bool]:
-    """Verify polygon contact and sampled annular coverage for every neighbor pair."""
+    """Verify measured polygon overlap and annular coverage for every neighbor pair."""
     if len(poses) < 3 or len(poses) != len(world_profiles):
         return _failed_circular_row_verification()
     if any(not _is_usable_profile_polygon(profile) for profile in world_profiles):
@@ -316,13 +423,27 @@ def _verify_circular_row_coverage(
     angular_spacing = 2.0 * math.pi / len(poses)
     max_neighbor_gap = 0.0
     wraparound_passed = False
+    overlap_fractions: list[float] = []
+    pair_gap_results: list[bool] = []
+    local_samples = _profile_interior_sample_points(local_profile)
+    world_sample_sets = [
+        transform_profile(local_samples, pose.x_m, pose.y_m, pose.heading_rad)
+        for pose in poses
+    ]
 
     for index, first_profile in enumerate(world_profiles):
         next_index = (index + 1) % len(world_profiles)
         second_profile = world_profiles[next_index]
-        neighbor_gap = _polygon_distance(first_profile, second_profile)
+        overlap_fraction = _estimate_neighbor_overlap_fraction(
+            first_profile,
+            second_profile,
+            first_sample_points=world_sample_sets[index],
+            second_sample_points=world_sample_sets[next_index],
+        )
+        overlap_fractions.append(overlap_fraction)
+        neighbor_gap = 0.0 if overlap_fraction > 0.0 else _polygon_distance(first_profile, second_profile)
         max_neighbor_gap = max(max_neighbor_gap, neighbor_gap)
-        contact_passed = neighbor_gap <= CIRCULAR_GAP_TOLERANCE_M
+        overlap_passed = overlap_fraction >= minimum_overlap_fraction
 
         theta_start = float(poses[index].theta_rad or 0.0)
         band_passed = _circular_pair_covers_test_band(
@@ -333,22 +454,28 @@ def _verify_circular_row_coverage(
             first_profile,
             second_profile,
         )
-        pair_passed = contact_passed and band_passed
+        no_gap = overlap_fraction > 0.0 and band_passed
+        pair_gap_results.append(no_gap)
+        pair_passed = overlap_passed and no_gap
         if next_index == 0:
             wraparound_passed = pair_passed
-        if not pair_passed:
-            return {
-                "max_neighbor_gap_distance_m": max_neighbor_gap,
-                "minimum_neighbor_contact_passed": False,
-                "wraparound_passed": wraparound_passed,
-                "continuous_coverage_verified": False,
-            }
+
+    minimum_overlap = min(overlap_fractions)
+    average_overlap = float(np.mean(overlap_fractions))
+    maximum_overlap = max(overlap_fractions)
+    no_neighbor_gaps = bool(all(pair_gap_results))
+    minimum_overlap_passed = minimum_overlap >= minimum_overlap_fraction
 
     return {
         "max_neighbor_gap_distance_m": max_neighbor_gap,
-        "minimum_neighbor_contact_passed": True,
+        "minimum_neighbor_contact_passed": minimum_overlap_passed,
         "wraparound_passed": wraparound_passed,
-        "continuous_coverage_verified": wraparound_passed,
+        "continuous_coverage_verified": no_neighbor_gaps and minimum_overlap_passed and wraparound_passed,
+        "minimum_neighbor_overlap_fraction": minimum_overlap,
+        "average_neighbor_overlap_fraction": average_overlap,
+        "maximum_neighbor_overlap_fraction": maximum_overlap,
+        "wraparound_overlap_fraction": overlap_fractions[-1],
+        "no_neighbor_gaps_verified": no_neighbor_gaps,
     }
 
 
@@ -358,7 +485,59 @@ def _failed_circular_row_verification() -> dict[str, float | int | bool]:
         "minimum_neighbor_contact_passed": False,
         "wraparound_passed": False,
         "continuous_coverage_verified": False,
+        "minimum_neighbor_overlap_fraction": 0.0,
+        "average_neighbor_overlap_fraction": 0.0,
+        "maximum_neighbor_overlap_fraction": 0.0,
+        "wraparound_overlap_fraction": 0.0,
+        "no_neighbor_gaps_verified": False,
     }
+
+
+def _estimate_neighbor_overlap_fraction(
+    first_profile: np.ndarray,
+    second_profile: np.ndarray,
+    *,
+    first_sample_points: np.ndarray | None = None,
+    second_sample_points: np.ndarray | None = None,
+) -> float:
+    """Estimate intersection area as a fraction of the first transformed profile."""
+    if not _is_usable_profile_polygon(first_profile) or not _is_usable_profile_polygon(second_profile):
+        return 0.0
+    if first_sample_points is not None and second_sample_points is not None:
+        if (
+            first_sample_points.ndim != 2
+            or first_sample_points.shape[1] != 2
+            or len(first_sample_points) == 0
+            or second_sample_points.ndim != 2
+            or second_sample_points.shape[1] != 2
+            or len(second_sample_points) == 0
+        ):
+            return 0.0
+        first_fraction = np.count_nonzero(_points_in_polygon(first_sample_points, second_profile)) / len(
+            first_sample_points
+        )
+        second_fraction = np.count_nonzero(_points_in_polygon(second_sample_points, first_profile)) / len(
+            second_sample_points
+        )
+        return float((first_fraction + second_fraction) / 2.0)
+    return _estimate_union_overlap_ratio(
+        first_profile,
+        [(second_profile, _polygon_bounds(second_profile))],
+    )
+
+
+def _profile_interior_sample_points(local_profile: np.ndarray) -> np.ndarray:
+    """Return a rotation-stable uniform sample of the local profile interior."""
+    min_x, min_y, max_x, max_y = _polygon_bounds(local_profile)
+    x_step = (max_x - min_x) / CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE
+    y_step = (max_y - min_y) / CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE
+    if x_step <= 0.0 or y_step <= 0.0:
+        return np.empty((0, 2), dtype=float)
+    xs = min_x + (np.arange(CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE) + 0.5) * x_step
+    ys = min_y + (np.arange(CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE) + 0.5) * y_step
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+    return points[_points_in_polygon(points, local_profile)]
 
 
 def _circular_pair_covers_test_band(
@@ -708,7 +887,7 @@ def build_mission_plan(
     profile_config: RainbowProfileConfig | None = None,
     clockwise: bool = False,
 ) -> OuterEdgeSweepMission:
-    """Build a mission, selecting circular spacing by coverage when candidates are provided."""
+    """Build a mission, selecting the circular row strategy when candidates are enabled."""
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     if not circular_spacing_candidates:
         return _build_mission_plan_once(
@@ -727,32 +906,28 @@ def build_mission_plan(
 
     candidate_missions: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]] = []
     for row_count in range(DEFAULT_MAX_CIRCULAR_ROWS + 1):
-        row_spacing_factors: tuple[float | None, ...] = (None,) if row_count == 0 else circular_spacing_candidates
-        for candidate_factor in row_spacing_factors:
-            if candidate_factor is not None and candidate_factor < 0.80:
-                continue
-            try:
-                mission = _build_mission_plan_once(
-                    model,
-                    outer_edge_offset_m=outer_edge_offset_m,
-                    row_spacing_m=row_spacing_m,
-                    spacing_factor=spacing_factor if candidate_factor is None else candidate_factor,
-                    fixed_circular_rows=row_count,
-                    max_circular_gap_fraction=max_circular_gap_fraction,
-                    circular_stop_backoff_rows=circular_stop_backoff_rows,
-                    vertical_spacing_factor=vertical_spacing_factor,
-                    overlap_discard_threshold=overlap_discard_threshold,
-                    interior_enabled=interior_enabled,
-                    profile_config=profile_config,
-                    clockwise=clockwise,
-                )
-            except ValueError:
-                continue
-            if len(mission.circular_rows) != row_count:
-                continue
-            coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
-            travel_distance = _estimate_mission_travel_distance(mission.poses)
-            candidate_missions.append((row_count, candidate_factor, mission, coverage, travel_distance))
+        try:
+            mission = _build_mission_plan_once(
+                model,
+                outer_edge_offset_m=outer_edge_offset_m,
+                row_spacing_m=row_spacing_m,
+                spacing_factor=spacing_factor,
+                fixed_circular_rows=row_count,
+                max_circular_gap_fraction=max_circular_gap_fraction,
+                circular_stop_backoff_rows=circular_stop_backoff_rows,
+                vertical_spacing_factor=vertical_spacing_factor,
+                overlap_discard_threshold=overlap_discard_threshold,
+                interior_enabled=interior_enabled,
+                profile_config=profile_config,
+                clockwise=clockwise,
+            )
+        except ValueError:
+            continue
+        if len(mission.circular_rows) != row_count:
+            continue
+        coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
+        travel_distance = _estimate_mission_travel_distance(mission.poses)
+        candidate_missions.append((row_count, None, mission, coverage, travel_distance))
 
     if not candidate_missions:
         raise ValueError("No valid circular spacing candidates were provided.")
@@ -777,8 +952,8 @@ def build_mission_plan(
     ]
     return replace(
         selected_mission,
-        spacing_factor=selected_factor,
-        selected_circular_spacing_factor=selected_factor,
+        spacing_factor=spacing_factor,
+        selected_circular_spacing_factor=None,
         circular_spacing_candidates=candidate_records,
         circular_spacing_selection_reason=_circular_spacing_selection_reason(candidate_records),
     )
@@ -841,11 +1016,10 @@ def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate
         return None
     if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
         return (
-            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row/spacing strategy"
+            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row strategy"
         )
     return (
-        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row/spacing coverage "
-        "without going below the allowed overlap limit"
+        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row coverage"
     )
 
 
@@ -1405,6 +1579,13 @@ def print_mission_summary(
             f"wraparound={'pass' if row.wraparound_passed else 'fail'}, "
             f"continuous_coverage={'verified' if row.continuous_coverage_verified else 'failed'}"
         )
+        print(
+            f"    neighbor_overlap: min={100.0 * row.minimum_neighbor_overlap_fraction:.2f}%, "
+            f"avg={100.0 * row.average_neighbor_overlap_fraction:.2f}%, "
+            f"max={100.0 * row.maximum_neighbor_overlap_fraction:.2f}%, "
+            f"wraparound={100.0 * row.wraparound_overlap_fraction:.2f}%, "
+            f"no_gaps={'verified' if row.no_neighbor_gaps_verified else 'failed'}"
+        )
     if mission.rejected_circular_radius_m is not None:
         print(f"Circular stop radius: {mission.rejected_circular_radius_m:.6g} m")
     print(f"Circular wrapping stop reason: {mission.circular_stop_reason}")
@@ -1948,10 +2129,10 @@ def _estimate_tank_coverage(
 
 
 def _warn_for_spacing_factor(spacing_factor: float) -> None:
-    if spacing_factor < 0.25 or spacing_factor > 1.25:
+    if not math.isclose(spacing_factor, DEFAULT_SPACING_FACTOR):
         print(
-            "Warning: spacing factor is outside the typical v1 range of 0.25 to 1.25; "
-            "expect unusual overlap or gaps."
+            "Warning: --spacing-factor is retained for compatibility but circular profile density "
+            "is now selected from measured neighboring-polygon overlap."
         )
 
 
@@ -2096,9 +2277,8 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_SPACING_FACTOR,
         help=(
-            "Multiplier on the maximum non-overlapping circular pose count. Values above 1 reduce density; "
-            "values below 1 are capped to prevent overlap. "
-            f"Default: {DEFAULT_SPACING_FACTOR}."
+            "Legacy compatibility option. Circular profile density is now selected from measured "
+            f"neighbor overlap. Default: {DEFAULT_SPACING_FACTOR}."
         ),
     )
     parser.add_argument(
