@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,15 @@ DEFAULT_PLOT_PATH = "mission_preview.png"
 VERTICAL_SLOPE_TOLERANCE = 0.02
 VERTICAL_X_GROUP_TOLERANCE_M = 0.02
 VERTICAL_LINE_COVERAGE_RATIO = 0.60
+HORIZONTAL_Y_GROUP_TOLERANCE_M = VERTICAL_X_GROUP_TOLERANCE_M
+HORIZONTAL_FRAGMENT_MERGE_GAP_M = 0.05
+HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION = 0.15
+HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M = 0.08
+PERPENDICULAR_SECTION_CLEARANCE_M = 0.02
+SECTION_BOUNDARY_MATCH_TOLERANCE_M = 0.03
+SECTION_MIN_LENGTH_M = 1e-6
+INTERIOR_POSE_POSITION_TOLERANCE_M = 0.01
+INTERIOR_POSE_ANGLE_TOLERANCE_RAD = math.radians(1.0)
 OVERLAP_SAMPLE_GRID_SIZE = 28
 CIRCULAR_GAP_TOLERANCE_M = 0.002
 CIRCULAR_TEST_BAND_HALF_WIDTH_M = 0.005
@@ -70,6 +79,10 @@ class SweepPose:
     theta_rad: float | None = None
     sweep_radius_m: float | None = None
     status: str = "kept"
+    orientation: str | None = None
+    group_id: int | None = None
+    section_id: int | None = None
+    travel_direction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +93,31 @@ class VerticalPlateColumn:
     right_weld_x_m: float
     min_y_m: float
     max_y_m: float
+
+
+@dataclass(frozen=True)
+class InteriorSection:
+    section_id: int
+    group_id: int
+    orientation: str
+    center_cross_m: float
+    lower_weld_coordinate_m: float
+    upper_weld_coordinate_m: float
+    progress_min_m: float
+    progress_max_m: float
+    source_segment_count: int = 0
+
+
+@dataclass(frozen=True)
+class LawnmowerSectionLine:
+    """One deterministically ordered straight interior section."""
+
+    line_id: int
+    orientation: str
+    order_index: int
+    source_section_id: int
+    start_m: tuple[float, float]
+    end_m: tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -161,6 +199,13 @@ class OuterEdgeSweepMission:
     poses: list[SweepPose]
     source_dxf: str | None = None
     tank_estimate_method: str = "bounds"
+    horizontal_sections: list[InteriorSection] = field(default_factory=list)
+    vertical_group_count: int = 0
+    horizontal_group_count: int = 0
+    vertical_scan_count: int = 0
+    horizontal_scan_count: int = 0
+    duplicate_poses_removed: int = 0
+    invalid_horizontal_segments_skipped: int = 0
 
 
 def estimate_tank_circle_from_geometry(model: GeometryModel) -> TankCircleEstimate:
@@ -797,6 +842,13 @@ def build_outer_edge_sweep_mission(
         vertical_spacing_factor=DEFAULT_VERTICAL_SPACING_FACTOR,
         overlap_discard_threshold=DEFAULT_OVERLAP_DISCARD_THRESHOLD,
         vertical_columns=[],
+        horizontal_sections=[],
+        vertical_group_count=0,
+        horizontal_group_count=0,
+        vertical_scan_count=0,
+        horizontal_scan_count=0,
+        duplicate_poses_removed=0,
+        invalid_horizontal_segments_skipped=0,
         edge_sweep_scan_count=len(circular_plan.poses),
         interior_kept_count=0,
         interior_discarded_count=0,
@@ -859,16 +911,51 @@ def _build_mission_plan_once(
         vertical_spacing_factor=vertical_spacing_factor,
         overlap_discard_threshold=overlap_discard_threshold,
     )
+    horizontal_sections, invalid_horizontal_count = detect_horizontal_plate_rows(model, tank)
+    previous_pose = interior_poses[-1] if interior_poses else (edge_mission.poses[-1] if edge_mission.poses else None)
+    horizontal_poses, horizontal_discarded, invalid_horizontal_placement = generate_interior_horizontal_poses(
+        horizontal_sections,
+        tank,
+        edge_mission.poses,
+        scan_id_start=len(edge_mission.poses) + len(interior_poses),
+        profile_config=profile_config,
+        vertical_spacing_factor=vertical_spacing_factor,
+        overlap_discard_threshold=overlap_discard_threshold,
+        previous_pose=previous_pose,
+    )
+    combined_interior, duplicate_count = _deduplicate_interior_poses(
+        interior_poses + horizontal_poses,
+        scan_id_start=len(edge_mission.poses),
+    )
+    vertical_group_ids = {
+        pose.group_id
+        for pose in combined_interior
+        if pose.stage == "interior_vertical" and pose.group_id is not None
+    }
+    horizontal_group_ids = {
+        pose.group_id
+        for pose in combined_interior
+        if pose.stage == "interior_horizontal" and pose.group_id is not None
+    }
+    vertical_scan_count = sum(pose.stage == "interior_vertical" for pose in combined_interior)
+    horizontal_scan_count = sum(pose.stage == "interior_horizontal" for pose in combined_interior)
     return replace(
         edge_mission,
         interior_enabled=True,
         vertical_spacing_factor=vertical_spacing_factor,
         overlap_discard_threshold=overlap_discard_threshold,
         vertical_columns=columns,
-        interior_kept_count=len(interior_poses),
-        interior_discarded_count=discarded_count,
-        total_scan_count=len(edge_mission.poses) + len(interior_poses),
-        poses=edge_mission.poses + interior_poses,
+        horizontal_sections=horizontal_sections,
+        vertical_group_count=len(vertical_group_ids),
+        horizontal_group_count=len(horizontal_group_ids),
+        vertical_scan_count=vertical_scan_count,
+        horizontal_scan_count=horizontal_scan_count,
+        duplicate_poses_removed=duplicate_count,
+        invalid_horizontal_segments_skipped=invalid_horizontal_count + invalid_horizontal_placement,
+        interior_kept_count=len(combined_interior),
+        interior_discarded_count=discarded_count + horizontal_discarded,
+        total_scan_count=len(edge_mission.poses) + len(combined_interior),
+        poses=edge_mission.poses + combined_interior,
     )
 
 
@@ -1036,55 +1123,371 @@ def detect_vertical_plate_columns(
     model: GeometryModel,
     tank: TankCircleEstimate | None = None,
 ) -> list[VerticalPlateColumn]:
-    """Detect regular plate columns between long near-vertical DXF weld lines."""
+    """Compatibility wrapper for the existing vertical-column representation."""
+    sections, _invalid_count = detect_interior_sections(model, "vertical", tank)
+    return [
+        VerticalPlateColumn(
+            column_id=section.section_id,
+            center_x_m=section.center_cross_m,
+            left_weld_x_m=section.lower_weld_coordinate_m,
+            right_weld_x_m=section.upper_weld_coordinate_m,
+            min_y_m=section.progress_min_m,
+            max_y_m=section.progress_max_m,
+        )
+        for section in sections
+    ]
+
+
+def detect_horizontal_plate_rows(
+    model: GeometryModel,
+    tank: TankCircleEstimate | None = None,
+) -> tuple[list[InteriorSection], int]:
+    """Detect horizontal plate sections between long near-horizontal weld runs."""
+    return detect_interior_sections(model, "horizontal", tank)
+
+
+def detect_interior_sections(
+    model: GeometryModel,
+    orientation: str,
+    tank: TankCircleEstimate | None = None,
+) -> tuple[list[InteriorSection], int]:
+    """Detect plate sections between adjacent structural welds along either principal axis."""
+    if orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Interior section orientation must be 'vertical' or 'horizontal'.")
     tank = estimate_tank_circle_from_geometry(model) if tank is None else tank
-    grouped_segments = _group_vertical_segments(_iter_geometry_segments(model))
-    qualifying_lines: list[tuple[float, float, float]] = []
+    grouped_segments = _group_axis_segments(_iter_geometry_segments(model), orientation)
+    qualifying_lines: list[tuple[float, float, float, int]] = []
+    invalid_count = 0
 
-    for x_m, intervals in grouped_segments:
-        merged = _merge_intervals(intervals)
-        union_length = sum(end - start for start, end in merged)
-        radial_x = x_m - tank.center_x
-        chord_height = 2.0 * math.sqrt(max(0.0, tank.radius**2 - radial_x**2))
-        if chord_height <= 1e-9:
+    for cross_m, intervals, source_count in grouped_segments:
+        merge_tolerance = HORIZONTAL_FRAGMENT_MERGE_GAP_M if orientation == "horizontal" else 1e-6
+        merged = _merge_intervals(intervals, tolerance=merge_tolerance)
+        center_cross = tank.center_x if orientation == "vertical" else tank.center_y
+        radial_offset = cross_m - center_cross
+        chord_length = 2.0 * math.sqrt(max(0.0, tank.radius**2 - radial_offset**2))
+        if chord_length <= 1e-9 or not merged:
+            invalid_count += max(1, source_count)
             continue
-        if union_length / chord_height < VERTICAL_LINE_COVERAGE_RATIO:
-            continue
-        qualifying_lines.append(
-            (
-                x_m,
-                min(start for start, _end in merged),
-                max(end for _start, end in merged),
+
+        if orientation == "vertical":
+            union_length = sum(end - start for start, end in merged)
+            if union_length / chord_length < VERTICAL_LINE_COVERAGE_RATIO:
+                invalid_count += source_count
+                continue
+            qualifying_lines.append(
+                (
+                    cross_m,
+                    min(start for start, _end in merged),
+                    max(end for _start, end in merged),
+                    source_count,
+                )
             )
-        )
+            continue
 
-    qualifying_lines.sort(key=lambda item: item[0])
+        for start, end in merged:
+            if (end - start) / chord_length < VERTICAL_LINE_COVERAGE_RATIO:
+                invalid_count += 1
+                continue
+            qualifying_lines.append((cross_m, start, end, source_count))
+
+    qualifying_lines.sort(key=lambda item: (item[0], item[1], item[2]))
     if len(qualifying_lines) < 2:
-        return []
+        return [], invalid_count
 
-    gaps = np.diff([line[0] for line in qualifying_lines])
-    typical_gap = float(np.median(gaps))
+    unique_cross_values = sorted({line[0] for line in qualifying_lines})
+    positive_gaps = np.diff(unique_cross_values)
+    positive_gaps = positive_gaps[positive_gaps > 1e-9]
+    if len(positive_gaps) == 0:
+        return [], invalid_count + len(qualifying_lines)
+    typical_gap = float(np.median(positive_gaps))
     max_regular_gap = typical_gap * 1.5
-    columns: list[VerticalPlateColumn] = []
-    for left, right in zip(qualifying_lines, qualifying_lines[1:]):
-        gap = right[0] - left[0]
-        if gap <= 1e-9 or gap > max_regular_gap:
+    sections: list[InteriorSection] = []
+
+    for lower_index, lower in enumerate(qualifying_lines):
+        for upper in qualifying_lines[lower_index + 1 :]:
+            gap = upper[0] - lower[0]
+            if gap <= 1e-9:
+                continue
+            if gap > max_regular_gap:
+                break
+            if any(lower[0] < other_cross < upper[0] for other_cross in unique_cross_values):
+                continue
+            progress_min = max(lower[1], upper[1])
+            progress_max = min(lower[2], upper[2])
+            if progress_max <= progress_min:
+                invalid_count += 1
+                continue
+            section_id = len(sections)
+            sections.append(
+                InteriorSection(
+                    section_id=section_id,
+                    group_id=section_id,
+                    orientation=orientation,
+                    center_cross_m=(lower[0] + upper[0]) / 2.0,
+                    lower_weld_coordinate_m=lower[0],
+                    upper_weld_coordinate_m=upper[0],
+                    progress_min_m=progress_min,
+                    progress_max_m=progress_max,
+                    source_segment_count=lower[3] + upper[3],
+                )
+            )
+    return sections, invalid_count
+
+
+def generate_lawnmower_section_lines(
+    model: GeometryModel,
+    tank: TankCircleEstimate | None = None,
+) -> list[LawnmowerSectionLine]:
+    """Return direction-neutral vertical and horizontal centerlines without poses or paths."""
+    tank = estimate_tank_circle_from_geometry(model) if tank is None else tank
+    vertical_specs = _vertical_lawnmower_section_specs(model, tank)
+    horizontal_specs = _horizontal_lawnmower_section_specs(model, tank, vertical_specs)
+
+    lines: list[LawnmowerSectionLine] = []
+    vertical_order_index = 0
+    for center_x_m, min_y_m, max_y_m, source_section_id in vertical_specs:
+        clipped = _clip_axis_section_to_tank(
+            "vertical",
+            center_x_m,
+            min_y_m,
+            max_y_m,
+            tank,
+        )
+        if clipped is None:
             continue
-        min_y = max(left[1], right[1])
-        max_y = min(left[2], right[2])
-        if max_y <= min_y:
-            continue
-        columns.append(
-            VerticalPlateColumn(
-                column_id=len(columns),
-                center_x_m=(left[0] + right[0]) / 2.0,
-                left_weld_x_m=left[0],
-                right_weld_x_m=right[0],
-                min_y_m=min_y,
-                max_y_m=max_y,
+        order_index = vertical_order_index
+        vertical_order_index += 1
+        lower, upper = clipped
+        start = (center_x_m, lower)
+        end = (center_x_m, upper)
+        lines.append(
+            LawnmowerSectionLine(
+                line_id=len(lines),
+                orientation="vertical",
+                order_index=order_index,
+                source_section_id=source_section_id,
+                start_m=start,
+                end_m=end,
             )
         )
-    return columns
+
+    horizontal_order_index = 0
+    for center_y_m, min_x_m, max_x_m, source_section_id in horizontal_specs:
+        clipped = _clip_axis_section_to_tank(
+            "horizontal",
+            center_y_m,
+            min_x_m,
+            max_x_m,
+            tank,
+        )
+        if clipped is None:
+            continue
+        order_index = horizontal_order_index
+        horizontal_order_index += 1
+        lower, upper = clipped
+        start = (lower, center_y_m)
+        end = (upper, center_y_m)
+        lines.append(
+            LawnmowerSectionLine(
+                line_id=len(lines),
+                orientation="horizontal",
+                order_index=order_index,
+                source_section_id=source_section_id,
+                start_m=start,
+                end_m=end,
+            )
+        )
+    return lines
+
+
+def _vertical_lawnmower_section_specs(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+) -> list[tuple[float, float, float, int]]:
+    """Preserve existing column centers while retaining real vertical fragment gaps."""
+    columns = detect_vertical_plate_columns(model, tank)
+    grouped = _group_axis_segments(_iter_geometry_segments(model), "vertical")
+    specs: list[tuple[float, float, float, int]] = []
+    for column in columns:
+        left_intervals = _axis_group_intervals_at_coordinate(grouped, column.left_weld_x_m)
+        right_intervals = _axis_group_intervals_at_coordinate(grouped, column.right_weld_x_m)
+        if not left_intervals or not right_intervals:
+            continue
+        common_intervals = _intersect_interval_sets(
+            _merge_intervals(left_intervals),
+            _merge_intervals(right_intervals),
+        )
+        for start, end in common_intervals:
+            start = max(start, column.min_y_m)
+            end = min(end, column.max_y_m)
+            if end - start > SECTION_MIN_LENGTH_M:
+                specs.append((column.center_x_m, start, end, column.column_id))
+    return sorted(specs, key=lambda item: (item[0], item[1], item[2], item[3]))
+
+
+def _horizontal_lawnmower_section_specs(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+    vertical_specs: list[tuple[float, float, float, int]],
+) -> list[tuple[float, float, float, int]]:
+    """Pair horizontal weld fragments at the detected plate short-side spacing."""
+    groups = _group_axis_segments(_iter_geometry_segments(model), "horizontal")
+    if len(groups) < 2:
+        return []
+    merged_groups = [
+        (cross_m, _merge_intervals(intervals, HORIZONTAL_FRAGMENT_MERGE_GAP_M))
+        for cross_m, intervals, _source_count in groups
+    ]
+    target_spacing = _detected_plate_short_side_spacing(model, tank, merged_groups)
+    if target_spacing is None:
+        return []
+    spacing_tolerance = max(
+        HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M,
+        target_spacing * HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION,
+    )
+
+    raw_specs: list[tuple[float, float, float]] = []
+    for lower_index, (lower_y, lower_intervals) in enumerate(merged_groups):
+        for upper_y, upper_intervals in merged_groups[lower_index + 1 :]:
+            separation = upper_y - lower_y
+            if separation > target_spacing + spacing_tolerance:
+                break
+            if abs(separation - target_spacing) > spacing_tolerance:
+                continue
+            for progress_min, progress_max in _intersect_interval_sets(lower_intervals, upper_intervals):
+                clipped = _clip_axis_section_to_tank(
+                    "horizontal",
+                    (lower_y + upper_y) / 2.0,
+                    progress_min,
+                    progress_max,
+                    tank,
+                )
+                if clipped is not None:
+                    raw_specs.append(((lower_y + upper_y) / 2.0, clipped[0], clipped[1]))
+
+    grouped_specs: list[tuple[float, list[tuple[float, float]]]] = []
+    for center_y_m, progress_min_m, progress_max_m in sorted(raw_specs):
+        if grouped_specs and abs(center_y_m - grouped_specs[-1][0]) <= HORIZONTAL_Y_GROUP_TOLERANCE_M:
+            grouped_specs[-1][1].append((progress_min_m, progress_max_m))
+        else:
+            grouped_specs.append((center_y_m, [(progress_min_m, progress_max_m)]))
+
+    specs: list[tuple[float, float, float, int]] = []
+    for center_y_m, intervals in grouped_specs:
+        for progress_min_m, progress_max_m in _merge_intervals(intervals, HORIZONTAL_FRAGMENT_MERGE_GAP_M):
+            for clear_min_m, clear_max_m in _subtract_active_vertical_contacts(
+                center_y_m,
+                progress_min_m,
+                progress_max_m,
+                vertical_specs,
+            ):
+                if clear_max_m - clear_min_m > SECTION_MIN_LENGTH_M:
+                    specs.append((center_y_m, clear_min_m, clear_max_m, len(specs)))
+    return sorted(specs, key=lambda item: (item[0], item[1], item[2], item[3]))
+
+
+def _detected_plate_short_side_spacing(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+    horizontal_groups: list[tuple[float, list[tuple[float, float]]]],
+) -> float | None:
+    columns = detect_vertical_plate_columns(model, tank)
+    widths = [column.right_weld_x_m - column.left_weld_x_m for column in columns]
+    if widths:
+        return float(np.median(widths))
+    cross_values = sorted(cross_m for cross_m, intervals in horizontal_groups if intervals)
+    gaps = np.diff(cross_values)
+    gaps = gaps[gaps > SECTION_MIN_LENGTH_M]
+    if len(gaps) == 0:
+        return None
+    return float(np.median(gaps))
+
+
+def _subtract_active_vertical_contacts(
+    center_y_m: float,
+    progress_min_m: float,
+    progress_max_m: float,
+    vertical_specs: list[tuple[float, float, float, int]],
+) -> list[tuple[float, float]]:
+    intervals = [(progress_min_m, progress_max_m)]
+    blockers = sorted(
+        center_x_m
+        for center_x_m, min_y_m, max_y_m, _source_section_id in vertical_specs
+        if min_y_m - SECTION_MIN_LENGTH_M <= center_y_m <= max_y_m + SECTION_MIN_LENGTH_M
+        and progress_min_m - PERPENDICULAR_SECTION_CLEARANCE_M
+        <= center_x_m
+        <= progress_max_m + PERPENDICULAR_SECTION_CLEARANCE_M
+    )
+    for blocker_x_m in blockers:
+        blocked_min = blocker_x_m - PERPENDICULAR_SECTION_CLEARANCE_M
+        blocked_max = blocker_x_m + PERPENDICULAR_SECTION_CLEARANCE_M
+        next_intervals: list[tuple[float, float]] = []
+        for start, end in intervals:
+            if blocked_max <= start or blocked_min >= end:
+                next_intervals.append((start, end))
+                continue
+            if blocked_min - start > SECTION_MIN_LENGTH_M:
+                next_intervals.append((start, min(end, blocked_min)))
+            if end - blocked_max > SECTION_MIN_LENGTH_M:
+                next_intervals.append((max(start, blocked_max), end))
+        intervals = next_intervals
+    return intervals
+
+
+def _axis_group_intervals_at_coordinate(
+    groups: list[tuple[float, list[tuple[float, float]], int]],
+    coordinate_m: float,
+) -> list[tuple[float, float]]:
+    closest = min(groups, key=lambda item: abs(item[0] - coordinate_m), default=None)
+    if closest is None or abs(closest[0] - coordinate_m) > SECTION_BOUNDARY_MATCH_TOLERANCE_M:
+        return []
+    return closest[1]
+
+
+def _intersect_interval_sets(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    intersections: list[tuple[float, float]] = []
+    first_index = 0
+    second_index = 0
+    while first_index < len(first) and second_index < len(second):
+        first_start, first_end = first[first_index]
+        second_start, second_end = second[second_index]
+        start = max(first_start, second_start)
+        end = min(first_end, second_end)
+        if end - start > SECTION_MIN_LENGTH_M:
+            intersections.append((start, end))
+        if first_end < second_end:
+            first_index += 1
+        else:
+            second_index += 1
+    return intersections
+
+
+def _clip_axis_section_to_tank(
+    orientation: str,
+    cross_m: float,
+    progress_min_m: float,
+    progress_max_m: float,
+    tank: TankCircleEstimate,
+) -> tuple[float, float] | None:
+    if orientation == "vertical":
+        cross_offset = cross_m - tank.center_x
+        progress_center = tank.center_y
+    elif orientation == "horizontal":
+        cross_offset = cross_m - tank.center_y
+        progress_center = tank.center_x
+    else:
+        raise ValueError("Section orientation must be 'vertical' or 'horizontal'.")
+    if abs(cross_offset) >= tank.radius:
+        return None
+    half_chord = math.sqrt(max(0.0, tank.radius**2 - cross_offset**2))
+    lower = max(progress_min_m, progress_center - half_chord)
+    upper = min(progress_max_m, progress_center + half_chord)
+    if upper - lower <= SECTION_MIN_LENGTH_M:
+        return None
+    return float(lower), float(upper)
 
 
 def generate_interior_vertical_poses(
@@ -1101,12 +1504,7 @@ def generate_interior_vertical_poses(
     local_profile = make_rainbow_profile(profile_config)
     touching_step = _touching_vertical_step(local_profile)
     target_step = touching_step * vertical_spacing_factor
-    edge_polygons = [
-        transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
-        for pose in edge_poses
-        if pose.stage == "circular_edge"
-    ]
-    edge_polygon_records = [(polygon, _polygon_bounds(polygon)) for polygon in edge_polygons]
+    edge_polygon_records = _circular_edge_polygon_records(local_profile, edge_poses)
     regular_columns = _expand_vertical_columns_to_edge(
         columns,
         tank,
@@ -1144,6 +1542,145 @@ def generate_interior_vertical_poses(
     kept.extend(side_guard_poses)
     discarded_count += side_guard_discarded
     return kept, discarded_count
+
+
+def generate_interior_horizontal_poses(
+    sections: list[InteriorSection],
+    tank: TankCircleEstimate,
+    edge_poses: list[SweepPose],
+    *,
+    scan_id_start: int,
+    profile_config: RainbowProfileConfig,
+    vertical_spacing_factor: float,
+    overlap_discard_threshold: float,
+    previous_pose: SweepPose | None = None,
+) -> tuple[list[SweepPose], int, int]:
+    """Generate alternating left/right scans along detected horizontal sections."""
+    local_profile = make_rainbow_profile(profile_config)
+    heading_rad = math.pi / 2.0
+    rotated_profile = transform_profile(local_profile, 0.0, 0.0, heading_rad)
+    target_step = _touching_vertical_step(local_profile) * vertical_spacing_factor
+    edge_polygon_records = _circular_edge_polygon_records(local_profile, edge_poses)
+    ordered_sections = sorted(sections, key=lambda section: (section.center_cross_m, section.progress_min_m))
+
+    valid_rows: list[tuple[InteriorSection, np.ndarray]] = []
+    invalid_count = 0
+    for section in ordered_sections:
+        x_positions = _horizontal_section_x_positions(section, tank, rotated_profile, target_step)
+        if x_positions is None or len(x_positions) == 0:
+            invalid_count += 1
+            continue
+        valid_rows.append((section, x_positions))
+    if not valid_rows:
+        return [], 0, invalid_count
+
+    first_positions = valid_rows[0][1]
+    first_moves_right = True
+    if previous_pose is not None:
+        first_section = valid_rows[0][0]
+        left_distance = math.hypot(
+            previous_pose.x_m - float(first_positions[0]),
+            previous_pose.y_m - first_section.center_cross_m,
+        )
+        right_distance = math.hypot(
+            previous_pose.x_m - float(first_positions[-1]),
+            previous_pose.y_m - first_section.center_cross_m,
+        )
+        first_moves_right = left_distance <= right_distance
+
+    kept: list[SweepPose] = []
+    discarded_count = 0
+    for row_index, (section, x_positions) in enumerate(valid_rows):
+        moves_right = first_moves_right if row_index % 2 == 0 else not first_moves_right
+        ordered_x = x_positions if moves_right else x_positions[::-1]
+        travel_direction = "right" if moves_right else "left"
+        for x_m in ordered_x:
+            world_profile = transform_profile(
+                local_profile,
+                float(x_m),
+                section.center_cross_m,
+                heading_rad,
+            )
+            overlap_ratio = _estimate_union_overlap_ratio(world_profile, edge_polygon_records)
+            if overlap_ratio > overlap_discard_threshold:
+                discarded_count += 1
+                continue
+            kept.append(
+                SweepPose(
+                    scan_id=scan_id_start + len(kept),
+                    stage="interior_horizontal",
+                    x_m=float(x_m),
+                    y_m=section.center_cross_m,
+                    heading_rad=heading_rad,
+                    heading_deg=math.degrees(heading_rad),
+                    row_id=section.section_id,
+                    row_name="horizontal_section",
+                    orientation="horizontal",
+                    group_id=row_index,
+                    section_id=section.section_id,
+                    travel_direction=travel_direction,
+                )
+            )
+    return kept, discarded_count, invalid_count
+
+
+def _horizontal_section_x_positions(
+    section: InteriorSection,
+    tank: TankCircleEstimate,
+    rotated_profile: np.ndarray,
+    target_step: float,
+) -> np.ndarray | None:
+    x_bounds = _profile_center_x_bounds_at_y(
+        section.center_cross_m,
+        tank,
+        rotated_profile,
+        section.progress_min_m,
+        section.progress_max_m,
+    )
+    if x_bounds is None:
+        return None
+    x_min, x_max = x_bounds
+    span = x_max - x_min
+    interval_count = max(1, int(math.ceil(span / target_step)))
+    return np.linspace(x_min, x_max, interval_count + 1)
+
+
+def _circular_edge_polygon_records(
+    local_profile: np.ndarray,
+    poses: list[SweepPose],
+) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+    polygons = [
+        transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+        for pose in poses
+        if pose.stage == "circular_edge"
+    ]
+    return [(polygon, _polygon_bounds(polygon)) for polygon in polygons]
+
+
+def _deduplicate_interior_poses(
+    poses: list[SweepPose],
+    *,
+    scan_id_start: int,
+) -> tuple[list[SweepPose], int]:
+    kept: list[SweepPose] = []
+    removed = 0
+    for pose in poses:
+        duplicate = any(
+            math.hypot(pose.x_m - existing.x_m, pose.y_m - existing.y_m)
+            <= INTERIOR_POSE_POSITION_TOLERANCE_M
+            and _angle_difference(pose.heading_rad, existing.heading_rad)
+            <= INTERIOR_POSE_ANGLE_TOLERANCE_RAD
+            for existing in kept
+        )
+        if duplicate:
+            removed += 1
+            continue
+        kept.append(replace(pose, scan_id=scan_id_start + len(kept)))
+    return kept, removed
+
+
+def _angle_difference(first: float, second: float) -> float:
+    return abs((first - second + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 def _expand_vertical_columns_to_edge(
@@ -1263,7 +1800,8 @@ def _generate_regular_vertical_column_poses(
     y_positions = _regular_vertical_column_y_positions(column, tank, local_profile, target_step)
     if y_positions is None:
         return [], 0
-    if column_index % 2 == 1:
+    travel_direction = "down" if column_index % 2 == 1 else "up"
+    if travel_direction == "down":
         y_positions = y_positions[::-1]
 
     kept: list[SweepPose] = []
@@ -1284,6 +1822,10 @@ def _generate_regular_vertical_column_poses(
                 heading_deg=0.0,
                 column_id=column.column_id,
                 row_name="expanded_vertical" if column.column_id < 0 or column.column_id >= 1000 else None,
+                orientation="vertical",
+                group_id=column_index,
+                section_id=column.column_id,
+                travel_direction=travel_direction,
             )
         )
     return kept, discarded_count
@@ -1346,7 +1888,8 @@ def _generate_side_guard_poses(
         span = y_max - y_min
         interval_count = max(1, int(math.ceil(span / target_step)))
         y_positions = np.linspace(y_min, y_max, interval_count + 1)
-        if side_index % 2 == 1:
+        travel_direction = "down" if side_index % 2 == 1 else "up"
+        if travel_direction == "down":
             y_positions = y_positions[::-1]
 
         for y_m in y_positions:
@@ -1365,10 +1908,85 @@ def _generate_side_guard_poses(
                     heading_deg=math.degrees(SIDE_GUARD_HEADING_RAD),
                     column_id=column_id,
                     row_name=f"{side_name}_rotated_side_guard",
+                    orientation="vertical",
+                    group_id=len(columns) + side_index,
+                    section_id=column_id,
+                    travel_direction=travel_direction,
                 )
             )
 
     return kept, discarded_count
+
+
+def save_lawnmower_section_lines_json(
+    lines: list[LawnmowerSectionLine],
+    filepath: str | Path,
+) -> Path:
+    """Save the section-only geometry without mission poses or circular data."""
+    path = Path(filepath)
+    data = {
+        "units": "meters",
+        "section_count": len(lines),
+        "sections": [asdict(line) for line in lines],
+    }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def plot_lawnmower_section_lines(
+    model: GeometryModel,
+    lines: list[LawnmowerSectionLine],
+    *,
+    show: bool = True,
+    save_path: str | Path | None = None,
+) -> Any:
+    """Plot imported geometry plus straight interior section lines only."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    fig, ax = plt.subplots(figsize=(11, 11))
+    _plot_imported_geometry_background(ax, model)
+    colors = {"vertical": "#16a34a", "horizontal": "#dc2626"}
+    labels_drawn: set[str] = set()
+    for line in lines:
+        color = colors[line.orientation]
+        label = f"Generated {line.orientation} sections" if line.orientation not in labels_drawn else "_nolegend_"
+        labels_drawn.add(line.orientation)
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color=color,
+            linewidth=2.2,
+            alpha=0.92,
+            label=label,
+            zorder=4,
+        )
+
+    if model.bounds is not None:
+        span = max(model.bounds.width, model.bounds.height, 1e-9)
+        margin = span * 0.04
+        ax.set_xlim(model.bounds.min_x - margin, model.bounds.max_x + margin)
+        ax.set_ylim(model.bounds.min_y - margin, model.bounds.max_y + margin)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title("Interior lawnmower section lines only")
+    ax.grid(True, alpha=0.18)
+    if lines:
+        ax.legend(loc="upper right")
+    else:
+        ax.legend(
+            handles=[Line2D([], [], color="#6b7280", label="Imported geometry")],
+            loc="upper right",
+        )
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200)
+    if show:
+        plt.show()
+    return fig, ax
 
 
 def save_mission_json(mission: OuterEdgeSweepMission, filepath: str | Path) -> Path:
@@ -1396,6 +2014,10 @@ def save_mission_csv(mission: OuterEdgeSweepMission, filepath: str | Path) -> Pa
         "sweep_radius_m",
         "profile_type",
         "status",
+        "orientation",
+        "group_id",
+        "section_id",
+        "travel_direction",
     ]
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1470,6 +2092,8 @@ def plot_outer_edge_sweep(
         if pose.stage == "circular_edge":
             color = circular_palette[int(pose.row_id or 0) % len(circular_palette)]
             style = {"color": color, "fill": color}
+        elif pose.stage == "interior_horizontal":
+            style = {"color": "#dc2626", "fill": "#fca5a5"}
         elif pose.stage == "interior_side_guard":
             style = {"color": "#0f766e", "fill": "#5eead4"}
         else:
@@ -1479,6 +2103,7 @@ def plot_outer_edge_sweep(
 
     circular_poses = [pose for pose in mission.poses if pose.stage == "circular_edge"]
     interior_poses = [pose for pose in mission.poses if pose.stage == "interior_vertical"]
+    horizontal_poses = [pose for pose in mission.poses if pose.stage == "interior_horizontal"]
     side_guard_poses = [pose for pose in mission.poses if pose.stage == "interior_side_guard"]
     for row in mission.circular_rows:
         row_poses = [pose for pose in circular_poses if pose.row_id == row.row_id]
@@ -1502,6 +2127,18 @@ def plot_outer_edge_sweep(
             label="Interior vertical centers",
             zorder=5,
         )
+        _plot_group_paths(ax, interior_poses, "#7c3aed", "Vertical travel path")
+    if horizontal_poses:
+        ax.scatter(
+            [pose.x_m for pose in horizontal_poses],
+            [pose.y_m for pose in horizontal_poses],
+            s=18,
+            color="#dc2626",
+            marker="^",
+            label="Interior horizontal centers",
+            zorder=5,
+        )
+        _plot_group_paths(ax, horizontal_poses, "#dc2626", "Horizontal travel path")
     if side_guard_poses:
         ax.scatter(
             [pose.x_m for pose in side_guard_poses],
@@ -1514,7 +2151,7 @@ def plot_outer_edge_sweep(
         )
     path_x = [pose.x_m for pose in mission.poses]
     path_y = [pose.y_m for pose in mission.poses]
-    ax.plot(path_x, path_y, color="#f97316", linewidth=1.0, alpha=0.65, label="Ordered mission path", zorder=4)
+    ax.plot(path_x, path_y, color="#f97316", linewidth=0.9, alpha=0.42, label="Ordered mission path", zorder=4)
     ax.scatter([cx], [cy], s=35, color="#111827", label="_nolegend_", zorder=6)
     _apply_plot_bounds(ax, model, mission)
     ax.set_aspect("equal", adjustable="box")
@@ -1592,11 +2229,16 @@ def print_mission_summary(
     print(f"Max circular gap fraction: {mission.max_circular_gap_fraction:.6g}")
     print(f"Total circular scans: {mission.edge_sweep_scan_count}")
     print(f"Detected vertical plate columns: {len(mission.vertical_columns)}")
-    vertical_count = sum(1 for pose in mission.poses if pose.stage == "interior_vertical")
     side_guard_count = sum(1 for pose in mission.poses if pose.stage == "interior_side_guard")
-    print(f"Interior vertical scans kept: {vertical_count}")
+    print(f"Detected horizontal plate sections: {len(mission.horizontal_sections)}")
+    print(f"Vertical groups: {mission.vertical_group_count}")
+    print(f"Horizontal groups: {mission.horizontal_group_count}")
+    print(f"Interior vertical scans kept: {mission.vertical_scan_count}")
+    print(f"Interior horizontal scans kept: {mission.horizontal_scan_count}")
     print(f"Rotated side-guard scans kept: {side_guard_count}")
-    print(f"Interior vertical scans discarded by overlap: {mission.interior_discarded_count}")
+    print(f"Interior scans discarded by circular-overlap filter: {mission.interior_discarded_count}")
+    print(f"Duplicate interior poses removed: {mission.duplicate_poses_removed}")
+    print(f"Invalid horizontal segments/sections skipped: {mission.invalid_horizontal_segments_skipped}")
     print(f"Total mission scans: {len(mission.poses)}")
     if mission.circular_spacing_candidates:
         print("Circular spacing comparison")
@@ -1921,38 +2563,60 @@ def _iter_geometry_segments(model: GeometryModel):
 
 
 def _group_vertical_segments(segments) -> list[tuple[float, list[tuple[float, float]]]]:
-    vertical: list[tuple[float, float, float, float]] = []
+    return [
+        (cross_m, intervals)
+        for cross_m, intervals, _source_count in _group_axis_segments(segments, "vertical")
+    ]
+
+
+def _group_axis_segments(
+    segments,
+    orientation: str,
+) -> list[tuple[float, list[tuple[float, float]], int]]:
+    if orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Axis grouping orientation must be 'vertical' or 'horizontal'.")
+    classified: list[tuple[float, float, float, float]] = []
     for start, end in segments:
         delta = end - start
         length = float(np.linalg.norm(delta))
-        if length <= 1e-9 or abs(float(delta[0])) > VERTICAL_SLOPE_TOLERANCE * length:
+        off_axis_delta = float(delta[0] if orientation == "vertical" else delta[1])
+        if length <= 1e-9 or abs(off_axis_delta) > VERTICAL_SLOPE_TOLERANCE * length:
             continue
-        vertical.append(
+        cross_start = float(start[0] if orientation == "vertical" else start[1])
+        cross_end = float(end[0] if orientation == "vertical" else end[1])
+        progress_start = float(start[1] if orientation == "vertical" else start[0])
+        progress_end = float(end[1] if orientation == "vertical" else end[0])
+        classified.append(
             (
-                float((start[0] + end[0]) / 2.0),
-                float(min(start[1], end[1])),
-                float(max(start[1], end[1])),
+                (cross_start + cross_end) / 2.0,
+                min(progress_start, progress_end),
+                max(progress_start, progress_end),
                 length,
             )
         )
-    vertical.sort(key=lambda item: item[0])
+    classified.sort(key=lambda item: item[0])
 
     groups: list[list[tuple[float, float, float, float]]] = []
-    for segment in vertical:
+    cross_tolerance = (
+        VERTICAL_X_GROUP_TOLERANCE_M
+        if orientation == "vertical"
+        else HORIZONTAL_Y_GROUP_TOLERANCE_M
+    )
+    for segment in classified:
         if not groups:
             groups.append([segment])
             continue
         group_x = sum(item[0] * item[3] for item in groups[-1]) / sum(item[3] for item in groups[-1])
-        if abs(segment[0] - group_x) <= VERTICAL_X_GROUP_TOLERANCE_M:
+        if abs(segment[0] - group_x) <= cross_tolerance:
             groups[-1].append(segment)
         else:
             groups.append([segment])
 
-    grouped: list[tuple[float, list[tuple[float, float]]]] = []
+    grouped: list[tuple[float, list[tuple[float, float]], int]] = []
     for group in groups:
         total_length = sum(item[3] for item in group)
-        x_m = sum(item[0] * item[3] for item in group) / total_length
-        grouped.append((x_m, [(item[1], item[2]) for item in group]))
+        cross_m = sum(item[0] * item[3] for item in group) / total_length
+        grouped.append((cross_m, [(item[1], item[2]) for item in group], len(group)))
     return grouped
 
 
@@ -1999,6 +2663,31 @@ def _profile_center_y_bounds_at_x(
         vertical_limit = math.sqrt(max(0.0, tank.radius**2 - radial_x**2))
         lower = max(lower, tank.center_y - vertical_limit - float(local_y))
         upper = min(upper, tank.center_y + vertical_limit - float(local_y))
+    if upper < lower:
+        return None
+    return lower, upper
+
+
+def _profile_center_x_bounds_at_y(
+    center_y_m: float,
+    tank: TankCircleEstimate,
+    profile_points: np.ndarray,
+    min_x_hint: float,
+    max_x_hint: float,
+) -> tuple[float, float] | None:
+    """Transpose the vertical bounds check for a profile progressing horizontally."""
+    min_local_x = float(np.min(profile_points[:, 0]))
+    max_local_x = float(np.max(profile_points[:, 0]))
+    lower = min_x_hint - min_local_x
+    upper = max_x_hint - max_local_x
+
+    for local_x, local_y in profile_points:
+        radial_y = center_y_m + float(local_y) - tank.center_y
+        if abs(radial_y) >= tank.radius:
+            return None
+        horizontal_limit = math.sqrt(max(0.0, tank.radius**2 - radial_y**2))
+        lower = max(lower, tank.center_x - horizontal_limit - float(local_x))
+        upper = min(upper, tank.center_x + horizontal_limit - float(local_x))
     if upper < lower:
         return None
     return lower, upper
@@ -2189,6 +2878,31 @@ def _sample_arc_points(
     return np.column_stack((center_x + radius * np.cos(angles), center_y + radius * np.sin(angles)))
 
 
+def _plot_group_paths(
+    ax: Any,
+    poses: list[SweepPose],
+    color: str,
+    label: str,
+) -> None:
+    group_ids = []
+    for pose in poses:
+        if pose.group_id is not None and pose.group_id not in group_ids:
+            group_ids.append(pose.group_id)
+    for index, group_id in enumerate(group_ids):
+        group = [pose for pose in poses if pose.group_id == group_id]
+        if len(group) < 2:
+            continue
+        ax.plot(
+            [pose.x_m for pose in group],
+            [pose.y_m for pose in group],
+            color=color,
+            linewidth=1.2,
+            alpha=0.8,
+            label=label if index == 0 else "_nolegend_",
+            zorder=4,
+        )
+
+
 def _plot_direction_arrows(ax: Any, poses: list[SweepPose], *, label: str | None) -> None:
     if len(poses) < 2:
         return
@@ -2250,7 +2964,9 @@ def _normalize_angle(angle_rad: float) -> float:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plan edge sweeps and vertical interior coverage from a tank DXF.")
+    parser = argparse.ArgumentParser(
+        description="Plan edge sweeps and axis-aligned interior coverage from a tank DXF."
+    )
     parser.add_argument("dxf_path", help="Path to the tank floor DXF file.")
     parser.add_argument(
         "--outer-edge-offset",
@@ -2320,6 +3036,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--disable-interior", action="store_true", help="Generate only accepted circular edge rows.")
+    parser.add_argument(
+        "--section-lines-only",
+        action="store_true",
+        help="Generate and plot ordered interior straight section lines without profiles or circular sweeps.",
+    )
+    parser.add_argument(
+        "--save-section-lines-json",
+        help="Optional JSON output for --section-lines-only geometry.",
+    )
     parser.add_argument("--clockwise", action="store_true", help="Generate poses in clockwise order.")
     parser.add_argument("--no-plot", action="store_true", help="Save plot without opening a matplotlib window.")
     parser.add_argument("--save-json", default=DEFAULT_JSON_PATH, help="Path for mission JSON output.")
@@ -2330,6 +3055,33 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if args.section_lines_only:
+        try:
+            model = import_dxf(args.dxf_path)
+            lines = generate_lawnmower_section_lines(model)
+        except (DxfImportError, ValueError) as exc:
+            print(f"Section-line generation failed: {exc}")
+            return 1
+        section_json_path = (
+            save_lawnmower_section_lines_json(lines, args.save_section_lines_json)
+            if args.save_section_lines_json
+            else None
+        )
+        plot_path = Path(args.save_plot) if args.save_plot else None
+        if args.save_plot or not args.no_plot:
+            plot_lawnmower_section_lines(model, lines, show=not args.no_plot, save_path=plot_path)
+        vertical_count = sum(line.orientation == "vertical" for line in lines)
+        horizontal_count = sum(line.orientation == "horizontal" for line in lines)
+        print("Lawnmower section-line summary")
+        print(f"Vertical section lines: {vertical_count}")
+        print(f"Horizontal section lines: {horizontal_count}")
+        print(f"Total section lines: {len(lines)}")
+        if section_json_path is not None:
+            print(f"Section JSON output: {section_json_path}")
+        if plot_path is not None:
+            print(f"Plot output: {plot_path}")
+        return 0
+
     _warn_for_spacing_factor(args.spacing_factor)
     _warn_for_row_spacing(args.row_spacing, RainbowProfileConfig())
     _warn_for_vertical_spacing_factor(args.vertical_spacing_factor)
