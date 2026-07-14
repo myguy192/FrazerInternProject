@@ -139,6 +139,23 @@ class LawnmowerSectionLineTests(unittest.TestCase):
         ranges = sorted((min(line.start_m[1], line.end_m[1]), max(line.start_m[1], line.end_m[1])) for line in vertical)
         self.assertEqual(ranges, [(-4.0, -1.0), (1.0, 4.0)])
 
+    def test_short_vertical_weld_pair_extends_across_supported_fragment_bands(self):
+        bands = [(-12, -7), (-6, -2), (-1, 3), (4, 8)]
+        long_boundaries = [
+            _line(x_m, start_m, x_m, end_m)
+            for x_m in (-1, 1, 3)
+            for start_m, end_m in bands
+        ]
+        short_pair = [_line(6, -10, 6, -7), _line(8, -10, 8, -7)]
+        model = _model(*long_boundaries, *short_pair, bounds=(-14, -14, 14, 14))
+        tank = TankCircleEstimate(center_x=0.0, center_y=0.0, radius=14.0, method="test")
+
+        vertical = _orientation(generate_lawnmower_section_lines(model, tank), "vertical")
+        added = [line for line in vertical if abs(line.start_m[0] - 7.0) < 1e-9]
+
+        self.assertEqual(len(added), 4)
+        self.assertEqual([(line.start_m[1], line.end_m[1]) for line in added], bands)
+
     def test_offset_tank_center_is_respected(self):
         tank = TankCircleEstimate(center_x=10.0, center_y=20.0, radius=5.0, method="test")
         model = _model(_line(9, 16, 9, 24), _line(11, 16, 11, 24), bounds=(5, 15, 15, 25))

@@ -1322,7 +1322,86 @@ def _vertical_lawnmower_section_specs(
             end = min(end, column.max_y_m)
             if end - start > SECTION_MIN_LENGTH_M:
                 specs.append((column.center_x_m, start, end, column.column_id))
+    specs = _add_short_vertical_fragment_columns(specs, grouped, columns)
     return sorted(specs, key=lambda item: (item[0], item[1], item[2], item[3]))
+
+
+def _add_short_vertical_fragment_columns(
+    specs: list[tuple[float, float, float, int]],
+    groups: list[tuple[float, list[tuple[float, float]], int]],
+    columns: list[VerticalPlateColumn],
+) -> list[tuple[float, float, float, int]]:
+    """Add plate centers bounded by short weld fragments in the dominant row bands."""
+    widths = [column.right_weld_x_m - column.left_weld_x_m for column in columns]
+    if not specs or not widths:
+        return specs
+    target_spacing = float(np.median(widths))
+    spacing_tolerance = max(
+        HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M,
+        target_spacing * HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION,
+    )
+
+    interval_bands: list[list[float]] = []
+    for _center_x_m, start_m, end_m, _source_section_id in specs:
+        matched_band = next(
+            (
+                band
+                for band in interval_bands
+                if abs(band[0] - start_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(band[1] - end_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+            ),
+            None,
+        )
+        if matched_band is None:
+            interval_bands.append([start_m, end_m, 1.0])
+        else:
+            count = matched_band[2]
+            matched_band[0] = (matched_band[0] * count + start_m) / (count + 1.0)
+            matched_band[1] = (matched_band[1] * count + end_m) / (count + 1.0)
+            matched_band[2] = count + 1.0
+    maximum_support = max(band[2] for band in interval_bands)
+    dominant_bands = [
+        (band[0], band[1])
+        for band in interval_bands
+        if band[2] >= maximum_support - 0.5
+    ]
+    if len(dominant_bands) < 3:
+        return specs
+
+    merged_groups = [
+        (cross_m, _merge_intervals(intervals))
+        for cross_m, intervals, _source_count in groups
+    ]
+    paired_centers: list[float] = []
+    for left_index, (left_x_m, left_intervals) in enumerate(merged_groups):
+        for right_x_m, right_intervals in merged_groups[left_index + 1 :]:
+            separation = right_x_m - left_x_m
+            if separation > target_spacing + spacing_tolerance:
+                break
+            if abs(separation - target_spacing) > spacing_tolerance:
+                continue
+            common_intervals = _intersect_interval_sets(left_intervals, right_intervals)
+            if any(
+                min(common_end, band_end) - max(common_start, band_start) > SECTION_MIN_LENGTH_M
+                for common_start, common_end in common_intervals
+                for band_start, band_end in dominant_bands
+            ):
+                paired_centers.append((left_x_m + right_x_m) / 2.0)
+
+    result = list(specs)
+    next_source_id = max(spec[3] for spec in specs) + 1
+    for center_x_m in sorted(paired_centers):
+        for band_start, band_end in sorted(dominant_bands):
+            duplicate = any(
+                abs(existing_x_m - center_x_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(existing_start_m - band_start) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(existing_end_m - band_end) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                for existing_x_m, existing_start_m, existing_end_m, _source_id in result
+            )
+            if not duplicate:
+                result.append((center_x_m, band_start, band_end, next_source_id))
+                next_source_id += 1
+    return result
 
 
 def _horizontal_lawnmower_section_specs(

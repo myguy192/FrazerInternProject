@@ -1,0 +1,62 @@
+{
+  "units": "meters",
+  "section_count": 4,
+  "sections": [
+    {
+      "line_id": 0,
+      "orientation": "vertical",
+      "order_index": 0,
+      "source_section_id": 0,
+      "start_m": [
+        -1.828800000000001,
+        -2.726214078167744
+      ],
+      "end_m": [
+        -1.828800000000001,
+        2.726214078167744
+      ]
+    },
+    {
+      "line_id": 1,
+      "orientation": "vertical",
+      "order_index": 1,
+      "source_section_id": 1,
+      "start_m": [
+        -0.6096000000000005,
+        -3.448418350490555
+      ],
+      "end_m": [
+        -0.6096000000000005,
+        3.448418350490555
+      ]
+    },
+    {
+      "line_id": 2,
+      "orientation": "vertical",
+      "order_index": 2,
+      "source_section_id": 2,
+      "start_m": [
+        0.6096000000000003,
+        -3.448418350490555
+      ],
+      "end_m": [
+        0.6096000000000003,
+        3.448418350490555
+      ]
+    },
+    {
+      "line_id": 3,
+      "orientation": "vertical",
+      "order_index": 3,
+      "source_section_id": 3,
+      "start_m": [
+        1.8288000000000006,
+        -2.726214078167744
+      ],
+      "end_m": [
+        1.8288000000000006,
+        2.726214078167744
+      ]
+    }
+  ]
+}
