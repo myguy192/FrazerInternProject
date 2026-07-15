@@ -223,6 +223,7 @@ class OuterEdgeSweepMission:
     horizontal_scan_count: int = 0
     duplicate_poses_removed: int = 0
     invalid_horizontal_segments_skipped: int = 0
+    lawnmower_section_lines: list[LawnmowerSectionLine] = field(default_factory=list)
 
 
 def estimate_tank_circle_from_geometry(model: GeometryModel) -> TankCircleEstimate:
@@ -917,31 +918,18 @@ def _build_mission_plan_once(
             overlap_discard_threshold=overlap_discard_threshold,
         )
 
-    tank = estimate_tank_circle_from_geometry(model)
-    columns = detect_vertical_plate_columns(model, tank)
-    interior_poses, discarded_count = generate_interior_vertical_poses(
-        columns,
-        tank,
-        edge_mission.poses,
-        scan_id_start=len(edge_mission.poses),
+    guide_lines = generate_lawnmower_section_lines(model)
+    lawnmower_placements = generate_lawnmower_scan_placements(
+        guide_lines,
         profile_config=profile_config,
-        vertical_spacing_factor=vertical_spacing_factor,
-        overlap_discard_threshold=overlap_discard_threshold,
     )
-    horizontal_sections, invalid_horizontal_count = detect_horizontal_plate_rows(model, tank)
-    previous_pose = interior_poses[-1] if interior_poses else (edge_mission.poses[-1] if edge_mission.poses else None)
-    horizontal_poses, horizontal_discarded, invalid_horizontal_placement = generate_interior_horizontal_poses(
-        horizontal_sections,
-        tank,
-        edge_mission.poses,
-        scan_id_start=len(edge_mission.poses) + len(interior_poses),
-        profile_config=profile_config,
-        vertical_spacing_factor=vertical_spacing_factor,
-        overlap_discard_threshold=overlap_discard_threshold,
-        previous_pose=previous_pose,
+    lawnmower_poses = _lawnmower_placements_to_sweep_poses(
+        guide_lines,
+        lawnmower_placements,
+        scan_id_start=len(edge_mission.poses),
     )
     combined_interior, duplicate_count = _deduplicate_interior_poses(
-        interior_poses + horizontal_poses,
+        lawnmower_poses,
         scan_id_start=len(edge_mission.poses),
     )
     vertical_group_ids = {
@@ -961,18 +949,19 @@ def _build_mission_plan_once(
         interior_enabled=True,
         vertical_spacing_factor=vertical_spacing_factor,
         overlap_discard_threshold=overlap_discard_threshold,
-        vertical_columns=columns,
-        horizontal_sections=horizontal_sections,
+        vertical_columns=[],
+        horizontal_sections=[],
         vertical_group_count=len(vertical_group_ids),
         horizontal_group_count=len(horizontal_group_ids),
         vertical_scan_count=vertical_scan_count,
         horizontal_scan_count=horizontal_scan_count,
         duplicate_poses_removed=duplicate_count,
-        invalid_horizontal_segments_skipped=invalid_horizontal_count + invalid_horizontal_placement,
+        invalid_horizontal_segments_skipped=0,
         interior_kept_count=len(combined_interior),
-        interior_discarded_count=discarded_count + horizontal_discarded,
+        interior_discarded_count=0,
         total_scan_count=len(edge_mission.poses) + len(combined_interior),
         poses=edge_mission.poses + combined_interior,
+        lawnmower_section_lines=guide_lines,
     )
 
 
@@ -1069,6 +1058,14 @@ def _select_circular_spacing_candidate(
     target_candidates = [
         candidate for candidate in candidates if candidate[3].covered_percent >= TARGET_COVERAGE_PERCENT
     ]
+    if not target_candidates:
+        # Keep a verified single circular row when the mission-wide target is
+        # missed, rather than adding a second row solely to chase coverage.
+        # This preserves the established one-row circular strategy while the
+        # independent lawnmower coverage system supplies the interior scans.
+        one_row_candidate = next((candidate for candidate in candidates if candidate[0] == 1), None)
+        if one_row_candidate is not None:
+            return one_row_candidate
     search_pool = target_candidates if target_candidates else candidates
     selected = search_pool[0]
     for candidate in search_pool[1:]:
@@ -1121,6 +1118,11 @@ def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate
     if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
         return (
             f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row strategy"
+        )
+    if selected.circular_rows == 1:
+        return (
+            f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; retained one verified circular row "
+            "rather than add a second row solely for coverage"
         )
     return (
         f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row coverage"
@@ -1384,6 +1386,46 @@ def generate_lawnmower_scan_placements(
                 continue
             placements.append(candidate)
     return placements
+
+
+def _lawnmower_placements_to_sweep_poses(
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    *,
+    scan_id_start: int,
+) -> list[SweepPose]:
+    """Convert approved anchored lawnmower placements into mission-compatible poses."""
+    lines_by_id = {line.line_id: line for line in lines}
+    ordered = sorted(
+        placements,
+        key=lambda placement: (
+            0 if placement.orientation == "vertical" else 1,
+            placement.guide_order_index,
+            placement.placement_index,
+        ),
+    )
+    poses: list[SweepPose] = []
+    for placement in ordered:
+        line = lines_by_id[placement.guide_line_id]
+        stage = "interior_vertical" if placement.orientation == "vertical" else "interior_horizontal"
+        poses.append(
+            SweepPose(
+                scan_id=scan_id_start + len(poses),
+                stage=stage,
+                x_m=placement.profile_origin_m[0],
+                y_m=placement.profile_origin_m[1],
+                heading_rad=placement.heading_rad,
+                heading_deg=placement.heading_deg,
+                row_id=placement.guide_line_id,
+                row_name=f"lawnmower_{placement.orientation}_guide",
+                column_id=line.source_section_id if placement.orientation == "vertical" else None,
+                orientation=placement.orientation,
+                group_id=placement.guide_order_index,
+                section_id=placement.guide_line_id,
+                travel_direction=placement.travel_direction,
+            )
+        )
+    return poses
 
 
 def lawnmower_scan_profile_polygon(
@@ -2671,9 +2713,11 @@ def print_mission_summary(
     print(f"Circular wrapping stop reason: {mission.circular_stop_reason}")
     print(f"Max circular gap fraction: {mission.max_circular_gap_fraction:.6g}")
     print(f"Total circular scans: {mission.edge_sweep_scan_count}")
-    print(f"Detected vertical plate columns: {len(mission.vertical_columns)}")
+    vertical_guides = sum(line.orientation == "vertical" for line in mission.lawnmower_section_lines)
+    horizontal_guides = sum(line.orientation == "horizontal" for line in mission.lawnmower_section_lines)
+    print(f"Lawnmower vertical guide lines: {vertical_guides}")
+    print(f"Lawnmower horizontal guide lines: {horizontal_guides}")
     side_guard_count = sum(1 for pose in mission.poses if pose.stage == "interior_side_guard")
-    print(f"Detected horizontal plate sections: {len(mission.horizontal_sections)}")
     print(f"Vertical groups: {mission.vertical_group_count}")
     print(f"Horizontal groups: {mission.horizontal_group_count}")
     print(f"Interior vertical scans kept: {mission.vertical_scan_count}")
