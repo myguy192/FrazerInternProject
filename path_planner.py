@@ -30,6 +30,7 @@ MAX_CIRCULAR_OVERLAP_FRACTION = 0.04
 DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
 DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
+DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION = 0.02
 SIDE_GUARD_HEADING_RAD = math.pi / 2.0
 DEFAULT_JSON_PATH = "mission_plan.json"
 DEFAULT_PLOT_PATH = "mission_preview.png"
@@ -118,6 +119,22 @@ class LawnmowerSectionLine:
     source_section_id: int
     start_m: tuple[float, float]
     end_m: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class LawnmowerScanPlacement:
+    """One rainbow profile anchored by its long-side midpoint on a guide line."""
+
+    placement_id: int
+    guide_line_id: int
+    guide_order_index: int
+    placement_index: int
+    orientation: str
+    travel_direction: str
+    anchor_m: tuple[float, float]
+    profile_origin_m: tuple[float, float]
+    heading_rad: float
+    heading_deg: float
 
 
 @dataclass(frozen=True)
@@ -1300,6 +1317,257 @@ def generate_lawnmower_section_lines(
     return lines
 
 
+def generate_lawnmower_scan_placements(
+    lines: list[LawnmowerSectionLine],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+    target_overlap_fraction: float = DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+) -> list[LawnmowerScanPlacement]:
+    """Place rainbow profiles along existing guide lines without altering them.
+
+    Each placement is translated from the midpoint of the rainbow's outer
+    1.600 m chord.  The chord remains perpendicular to the ordered guide
+    line while the profile's local positive-y direction follows travel.
+    """
+    if not 0.0 < target_overlap_fraction < 1.0:
+        raise ValueError("Lawnmower neighbor overlap fraction must be between 0 and 1.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    local_profile = make_rainbow_profile(profile_config)
+    long_side_start, long_side_end = _rainbow_long_side_endpoints(local_profile)
+    local_anchor = (long_side_start + long_side_end) / 2.0
+    target_step = _lawnmower_spacing_for_overlap(local_profile, target_overlap_fraction)
+
+    placements: list[LawnmowerScanPlacement] = []
+    for line in lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length <= SECTION_MIN_LENGTH_M:
+            continue
+        direction = delta / length
+        heading_rad = _normalize_angle(math.atan2(direction[1], direction[0]) - math.pi / 2.0)
+        canonical_start, canonical_direction = _canonical_lawnmower_line_reference(start, end)
+        anchor_distances = _lawnmower_anchor_distances(
+            length,
+            local_profile,
+            local_anchor,
+            target_step,
+        )
+        anchor_points = [canonical_start + canonical_direction * distance_m for distance_m in anchor_distances]
+        if float(np.dot(direction, canonical_direction)) < 0.0:
+            anchor_points.reverse()
+        travel_direction = _line_travel_direction(direction)
+        rotation = np.array(
+            [
+                [math.cos(heading_rad), -math.sin(heading_rad)],
+                [math.sin(heading_rad), math.cos(heading_rad)],
+            ],
+            dtype=float,
+        )
+        for placement_index, anchor in enumerate(anchor_points):
+            profile_origin = anchor - local_anchor @ rotation.T
+            candidate = LawnmowerScanPlacement(
+                placement_id=len(placements),
+                guide_line_id=line.line_id,
+                guide_order_index=line.order_index,
+                placement_index=placement_index,
+                orientation=line.orientation,
+                travel_direction=travel_direction,
+                anchor_m=(float(anchor[0]), float(anchor[1])),
+                profile_origin_m=(float(profile_origin[0]), float(profile_origin[1])),
+                heading_rad=heading_rad,
+                heading_deg=math.degrees(heading_rad),
+            )
+            if _is_effectively_duplicate_lawnmower_placement(candidate, placements):
+                continue
+            placements.append(candidate)
+    return placements
+
+
+def lawnmower_scan_profile_polygon(
+    placement: LawnmowerScanPlacement,
+    profile_config: RainbowProfileConfig | None = None,
+) -> np.ndarray:
+    """Return the transformed rainbow footprint for one lawnmower placement."""
+    local_profile = make_rainbow_profile(profile_config)
+    return transform_profile(
+        local_profile,
+        placement.profile_origin_m[0],
+        placement.profile_origin_m[1],
+        placement.heading_rad,
+    )
+
+
+def lawnmower_long_side_endpoints(
+    placement: LawnmowerScanPlacement,
+    profile_config: RainbowProfileConfig | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the transformed endpoints of the profile's 1.600 m outer chord."""
+    local_profile = make_rainbow_profile(profile_config)
+    start, end = _rainbow_long_side_endpoints(local_profile)
+    rotation = np.array(
+        [
+            [math.cos(placement.heading_rad), -math.sin(placement.heading_rad)],
+            [math.sin(placement.heading_rad), math.cos(placement.heading_rad)],
+        ],
+        dtype=float,
+    )
+    origin = np.asarray(placement.profile_origin_m, dtype=float)
+    return start @ rotation.T + origin, end @ rotation.T + origin
+
+
+def estimate_lawnmower_neighbor_overlap_fraction(
+    first: LawnmowerScanPlacement,
+    second: LawnmowerScanPlacement,
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> float:
+    """Estimate the actual polygon intersection area fraction for neighboring scans."""
+    local_profile = make_rainbow_profile(profile_config)
+    sample_points = _profile_interior_sample_points(local_profile)
+    first_polygon = transform_profile(
+        local_profile,
+        first.profile_origin_m[0],
+        first.profile_origin_m[1],
+        first.heading_rad,
+    )
+    second_polygon = transform_profile(
+        local_profile,
+        second.profile_origin_m[0],
+        second.profile_origin_m[1],
+        second.heading_rad,
+    )
+    first_samples = transform_profile(
+        sample_points,
+        first.profile_origin_m[0],
+        first.profile_origin_m[1],
+        first.heading_rad,
+    )
+    second_samples = transform_profile(
+        sample_points,
+        second.profile_origin_m[0],
+        second.profile_origin_m[1],
+        second.heading_rad,
+    )
+    return _estimate_neighbor_overlap_fraction(
+        first_polygon,
+        second_polygon,
+        first_sample_points=first_samples,
+        second_sample_points=second_samples,
+    )
+
+
+def _rainbow_long_side_endpoints(local_profile: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Find the outer 1.600 m chord from the upper endpoints of the side drops."""
+    min_x = float(np.min(local_profile[:, 0]))
+    max_x = float(np.max(local_profile[:, 0]))
+    tolerance = 1e-9
+    left_candidates = local_profile[np.isclose(local_profile[:, 0], min_x, atol=tolerance)]
+    right_candidates = local_profile[np.isclose(local_profile[:, 0], max_x, atol=tolerance)]
+    if len(left_candidates) == 0 or len(right_candidates) == 0:
+        raise ValueError("Rainbow profile does not contain identifiable long-side endpoints.")
+    left = left_candidates[np.argmax(left_candidates[:, 1])]
+    right = right_candidates[np.argmax(right_candidates[:, 1])]
+    expected_width = max_x - min_x
+    if not math.isclose(float(np.linalg.norm(right - left)), expected_width, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError("Rainbow profile does not preserve its long-side chord width.")
+    return left.copy(), right.copy()
+
+
+def _lawnmower_spacing_for_overlap(
+    local_profile: np.ndarray,
+    target_overlap_fraction: float,
+) -> float:
+    """Find local-y translation with the requested sampled polygon-area overlap."""
+    depth = float(np.max(local_profile[:, 1]) - np.min(local_profile[:, 1]))
+    if depth <= SECTION_MIN_LENGTH_M:
+        raise ValueError("Rainbow profile must have positive depth along a lawnmower guide line.")
+    sample_points = _profile_interior_sample_points(local_profile)
+    lower = 0.0
+    upper = depth
+    for _ in range(45):
+        midpoint = (lower + upper) / 2.0
+        overlap = _estimate_neighbor_overlap_fraction(
+            local_profile,
+            local_profile + np.array([0.0, midpoint]),
+            first_sample_points=sample_points,
+            second_sample_points=sample_points + np.array([0.0, midpoint]),
+        )
+        if overlap > target_overlap_fraction:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return float((lower + upper) / 2.0)
+
+
+def _lawnmower_anchor_distances(
+    line_length_m: float,
+    local_profile: np.ndarray,
+    local_anchor: np.ndarray,
+    target_step_m: float,
+) -> np.ndarray:
+    relative_progress = local_profile[:, 1] - local_anchor[1]
+    minimum_progress = float(np.min(relative_progress))
+    maximum_progress = float(np.max(relative_progress))
+    coverage_depth = maximum_progress - minimum_progress
+    if coverage_depth <= SECTION_MIN_LENGTH_M:
+        return np.array([line_length_m / 2.0])
+
+    first_anchor = max(0.0, -minimum_progress)
+    last_anchor = min(line_length_m, line_length_m - maximum_progress)
+    if line_length_m <= coverage_depth:
+        if last_anchor < first_anchor:
+            return np.array([line_length_m / 2.0])
+        return np.array([(first_anchor + last_anchor) / 2.0])
+
+    anchor_span = last_anchor - first_anchor
+    interval_count = max(1, int(math.ceil(anchor_span / target_step_m)))
+    total_coverage = coverage_depth + interval_count * target_step_m
+    endpoint_overhang = (total_coverage - line_length_m) / 2.0
+    first_anchor -= endpoint_overhang
+    return first_anchor + np.arange(interval_count + 1, dtype=float) * target_step_m
+
+
+def _line_travel_direction(direction: np.ndarray) -> str:
+    if abs(direction[0]) >= abs(direction[1]):
+        return "right" if direction[0] >= 0.0 else "left"
+    return "up" if direction[1] >= 0.0 else "down"
+
+
+def _canonical_lawnmower_line_reference(
+    start: np.ndarray,
+    end: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a stable endpoint order so reversing a guide reverses only traversal."""
+    if (float(start[0]), float(start[1])) <= (float(end[0]), float(end[1])):
+        canonical_start = start
+        canonical_end = end
+    else:
+        canonical_start = end
+        canonical_end = start
+    canonical_direction = canonical_end - canonical_start
+    canonical_direction /= np.linalg.norm(canonical_direction)
+    return canonical_start, canonical_direction
+
+
+def _is_effectively_duplicate_lawnmower_placement(
+    candidate: LawnmowerScanPlacement,
+    placements: list[LawnmowerScanPlacement],
+) -> bool:
+    return any(
+        math.hypot(
+            candidate.profile_origin_m[0] - existing.profile_origin_m[0],
+            candidate.profile_origin_m[1] - existing.profile_origin_m[1],
+        )
+        <= INTERIOR_POSE_POSITION_TOLERANCE_M
+        and _angle_difference(candidate.heading_rad, existing.heading_rad)
+        <= INTERIOR_POSE_ANGLE_TOLERANCE_RAD
+        for existing in placements
+    )
+
+
 def _vertical_lawnmower_section_specs(
     model: GeometryModel,
     tank: TankCircleEstimate,
@@ -2054,6 +2322,102 @@ def plot_lawnmower_section_lines(
     ax.set_title("Interior lawnmower section lines only")
     ax.grid(True, alpha=0.18)
     if lines:
+        ax.legend(loc="upper right")
+    else:
+        ax.legend(
+            handles=[Line2D([], [], color="#6b7280", label="Imported geometry")],
+            loc="upper right",
+        )
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200)
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_lawnmower_scan_placements(
+    model: GeometryModel,
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+    show: bool = True,
+    save_path: str | Path | None = None,
+) -> Any:
+    """Plot existing guide lines and their anchored interior rainbow footprints only."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    fig, ax = plt.subplots(figsize=(11, 11))
+    _plot_imported_geometry_background(ax, model)
+
+    guide_colors = {"vertical": "#16a34a", "horizontal": "#dc2626"}
+    guide_labels_drawn: set[str] = set()
+    for line in lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        label = (
+            f"Existing {line.orientation} guide lines"
+            if line.orientation not in guide_labels_drawn
+            else "_nolegend_"
+        )
+        guide_labels_drawn.add(line.orientation)
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color=guide_colors[line.orientation],
+            linewidth=1.8,
+            alpha=0.9,
+            label=label,
+            zorder=5,
+        )
+
+    for placement_index, placement in enumerate(placements):
+        polygon = lawnmower_scan_profile_polygon(placement, profile_config)
+        closed = _closed_points(polygon)
+        ax.fill(
+            closed[:, 0],
+            closed[:, 1],
+            color="#7c3aed",
+            alpha=0.055,
+            linewidth=0.0,
+            zorder=3,
+        )
+        ax.plot(
+            closed[:, 0],
+            closed[:, 1],
+            color="#7c3aed",
+            linewidth=0.45,
+            alpha=0.65,
+            label="Interior rainbow profiles" if placement_index == 0 else "_nolegend_",
+            zorder=4,
+        )
+
+    if placements:
+        anchors = np.asarray([placement.anchor_m for placement in placements], dtype=float)
+        ax.scatter(
+            anchors[:, 0],
+            anchors[:, 1],
+            color="#f59e0b",
+            s=6,
+            alpha=0.9,
+            label="Long-side midpoint anchors",
+            zorder=6,
+        )
+
+    if model.bounds is not None:
+        span = max(model.bounds.width, model.bounds.height, 1e-9)
+        margin = span * 0.04
+        ax.set_xlim(model.bounds.min_x - margin, model.bounds.max_x + margin)
+        ax.set_ylim(model.bounds.min_y - margin, model.bounds.max_y + margin)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title("Interior rainbow profiles anchored to existing lawnmower guide lines")
+    ax.grid(True, alpha=0.18)
+    if lines or placements:
         ax.legend(loc="upper right")
     else:
         ax.legend(
@@ -3121,6 +3485,11 @@ def _parse_args() -> argparse.Namespace:
         help="Generate and plot ordered interior straight section lines without profiles or circular sweeps.",
     )
     parser.add_argument(
+        "--lawnmower-profiles-only",
+        action="store_true",
+        help="Plot rainbow profiles anchored to existing interior guide lines without circular sweeps.",
+    )
+    parser.add_argument(
         "--save-section-lines-json",
         help="Optional JSON output for --section-lines-only geometry.",
     )
@@ -3134,6 +3503,33 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if args.lawnmower_profiles_only:
+        try:
+            model = import_dxf(args.dxf_path)
+            lines = generate_lawnmower_section_lines(model)
+            placements = generate_lawnmower_scan_placements(lines)
+        except (DxfImportError, ValueError) as exc:
+            print(f"Lawnmower profile placement failed: {exc}")
+            return 1
+        plot_path = Path(args.save_plot) if args.save_plot else None
+        if args.save_plot or not args.no_plot:
+            plot_lawnmower_scan_placements(
+                model,
+                lines,
+                placements,
+                show=not args.no_plot,
+                save_path=plot_path,
+            )
+        vertical_count = sum(placement.orientation == "vertical" for placement in placements)
+        horizontal_count = sum(placement.orientation == "horizontal" for placement in placements)
+        print("Lawnmower rainbow profile summary")
+        print(f"Vertical guide-line profiles: {vertical_count}")
+        print(f"Horizontal guide-line profiles: {horizontal_count}")
+        print(f"Total interior profiles: {len(placements)}")
+        if plot_path is not None:
+            print(f"Plot output: {plot_path}")
+        return 0
+
     if args.section_lines_only:
         try:
             model = import_dxf(args.dxf_path)
