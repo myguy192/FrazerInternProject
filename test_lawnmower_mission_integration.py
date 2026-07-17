@@ -10,11 +10,10 @@ matplotlib.use("Agg")
 
 from dxf_importer import Bounds, GeometryModel, LineSegment, Point2D
 from path_planner import (
-    CoverageEstimate,
     _build_mission_plan_once,
     _lawnmower_placements_to_sweep_poses,
-    _select_circular_spacing_candidate,
     build_outer_edge_sweep_mission,
+    determine_max_feasible_circular_rows,
     generate_lawnmower_scan_placements,
     generate_lawnmower_section_lines,
     plot_outer_edge_sweep,
@@ -42,16 +41,35 @@ def _model():
 
 
 class LawnmowerMissionIntegrationTests(unittest.TestCase):
-    def test_nonqualifying_circular_candidates_retain_one_verified_row(self):
-        candidates = [
-            (0, None, None, CoverageEstimate(0, 76.4, 0.0), 100.0),
-            (1, None, None, CoverageEstimate(1, 89.6, 0.0), 120.0),
-            (2, None, None, CoverageEstimate(2, 94.4, 0.0), 140.0),
-        ]
+    def test_geometry_limit_transitions_naturally_from_one_to_two_rows(self):
+        self.assertEqual(determine_max_feasible_circular_rows(3.7), 1)
+        self.assertEqual(determine_max_feasible_circular_rows(4.5), 2)
 
-        selected = _select_circular_spacing_candidate(candidates)
+    def test_robot_turning_radius_can_reduce_the_geometry_limit(self):
+        self.assertEqual(
+            determine_max_feasible_circular_rows(
+                10.0,
+                minimum_turning_radius_m=9.0,
+            ),
+            1,
+        )
 
-        self.assertEqual(selected[0], 1)
+    def test_fixed_two_row_request_is_capped_by_small_tank_geometry(self):
+        small_model = GeometryModel(
+            source_path=None,
+            line_segments=[],
+            arcs=[],
+            circles=[],
+            bounds=Bounds(-3.7, -3.7, 3.7, 3.7),
+        )
+
+        mission = build_outer_edge_sweep_mission(
+            small_model,
+            fixed_circular_rows=2,
+        )
+
+        self.assertEqual(len(mission.circular_rows), 1)
+        self.assertEqual(mission.circular_stop_reason, "geometry_row_limit")
 
     def test_normal_mission_uses_only_approved_lawnmower_poses_after_circular_stage(self):
         model = _model()
@@ -105,6 +123,17 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
         )
         self.assertIsNotNone(figure)
         figure.clf()
+
+    def test_normal_mission_does_not_call_experimental_outer_guide_generation(self):
+        with patch(
+            "path_planner._add_outer_lawnmower_sections",
+            side_effect=AssertionError("experimental outer guides were invoked"),
+        ):
+            mission = _build_mission_plan_once(_model(), fixed_circular_rows=1)
+
+        self.assertFalse(
+            any(line.is_outer_extension for line in mission.lawnmower_section_lines)
+        )
 
 
 if __name__ == "__main__":

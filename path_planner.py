@@ -32,7 +32,6 @@ DEFAULT_SPACING_FACTOR = 1.0
 # directly from measured neighboring-polygon overlap.
 DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.0,)
 DEFAULT_MAX_CIRCULAR_ROWS = 2
-TARGET_COVERAGE_PERCENT = 95.0
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
 DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.04
@@ -678,6 +677,51 @@ def _is_usable_profile_polygon(polygon: np.ndarray) -> bool:
     )
 
 
+def determine_max_feasible_circular_rows(
+    tank_radius: float,
+    *,
+    outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
+    row_spacing_m: float = DEFAULT_ROW_SPACING,
+    profile_config: RainbowProfileConfig | None = None,
+    minimum_turning_radius_m: float | None = None,
+    preferred_max_rows: int = DEFAULT_MAX_CIRCULAR_ROWS,
+) -> int:
+    """Return the geometry-supported circular-row limit, capped by preference.
+
+    In the absence of a separate robot turning-radius constant, the full scan
+    footprint width is the conservative minimum usable path radius. This keeps
+    a circular robot path from becoming tighter than the footprint it carries.
+    Every generated row must still pass the existing polygon continuity,
+    overlap, no-gap, and wraparound checks before mission acceptance.
+    """
+    if tank_radius <= 0.0:
+        raise ValueError("Tank radius must be positive.")
+    if outer_edge_offset_m < 0.0:
+        raise ValueError("Outer edge offset must be non-negative.")
+    if row_spacing_m <= 0.0:
+        raise ValueError("Row spacing must be positive.")
+    if preferred_max_rows < 0:
+        raise ValueError("Preferred circular row count must be zero or greater.")
+    if minimum_turning_radius_m is not None and minimum_turning_radius_m <= 0.0:
+        raise ValueError("Minimum turning radius must be positive when provided.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    minimum_usable_radius = max(
+        profile_config.width,
+        minimum_turning_radius_m or 0.0,
+    )
+    sweep_radius = _profile_constrained_sweep_radius(
+        tank_radius,
+        profile_config,
+        outer_edge_offset_m,
+    )
+    feasible_rows = 0
+    while feasible_rows < preferred_max_rows and sweep_radius >= minimum_usable_radius:
+        feasible_rows += 1
+        sweep_radius -= row_spacing_m
+    return feasible_rows
+
+
 def _generate_circular_sweep_plan(
     tank_center: tuple[float, float],
     tank_radius: float,
@@ -700,11 +744,18 @@ def _generate_circular_sweep_plan(
     )
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     current_radius = _profile_constrained_sweep_radius(tank_radius, profile_config, outer_edge_offset_m)
+    max_feasible_rows = determine_max_feasible_circular_rows(
+        tank_radius,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        profile_config=profile_config,
+        preferred_max_rows=DEFAULT_MAX_CIRCULAR_ROWS,
+    )
     rows: list[CircularSweepRow] = []
     poses: list[SweepPose] = []
     start_theta = 0.0
 
-    while current_radius > profile_config.width / 2.0 and len(rows) < DEFAULT_MAX_CIRCULAR_ROWS:
+    while len(rows) < max_feasible_rows:
         generated = _generate_sweep_row_poses(
             tank_center,
             current_radius,
@@ -734,8 +785,8 @@ def _generate_circular_sweep_plan(
         start_theta = row_poses[-1].theta_rad
         current_radius -= row_spacing_m
 
-    if len(rows) >= DEFAULT_MAX_CIRCULAR_ROWS:
-        return CircularSweepPlan(rows, poses, current_radius, "max_circular_rows")
+    if len(rows) >= max_feasible_rows:
+        return CircularSweepPlan(rows, poses, current_radius, "geometry_row_limit")
 
     return _apply_circular_stop_backoff(rows, poses, current_radius, "radius", circular_stop_backoff_rows)
 
@@ -762,13 +813,18 @@ def _generate_fixed_circular_sweep_plan(
 
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     current_radius = _profile_constrained_sweep_radius(tank_radius, profile_config, outer_edge_offset_m)
+    max_feasible_rows = determine_max_feasible_circular_rows(
+        tank_radius,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        profile_config=profile_config,
+        preferred_max_rows=fixed_circular_rows,
+    )
     rows: list[CircularSweepRow] = []
     poses: list[SweepPose] = []
     start_theta = 0.0
 
-    for row_id in range(fixed_circular_rows):
-        if current_radius <= profile_config.width / 2.0:
-            return CircularSweepPlan(rows, poses, current_radius, "radius")
+    for row_id in range(max_feasible_rows):
         generated = _generate_sweep_row_poses(
             tank_center,
             current_radius,
@@ -792,7 +848,8 @@ def _generate_fixed_circular_sweep_plan(
         start_theta = row_poses[-1].theta_rad
         current_radius -= row_spacing_m
 
-    return CircularSweepPlan(rows, poses, None, "fixed_row_count")
+    stop_reason = "fixed_row_count" if max_feasible_rows == fixed_circular_rows else "geometry_row_limit"
+    return CircularSweepPlan(rows, poses, current_radius, stop_reason)
 
 
 def _apply_circular_stop_backoff(
@@ -1029,152 +1086,43 @@ def build_mission_plan(
     profile_config: RainbowProfileConfig | None = None,
     clockwise: bool = False,
 ) -> OuterEdgeSweepMission:
-    """Build a mission, selecting the circular row strategy when candidates are enabled."""
+    """Build one mission using the authoritative geometry-derived row limit."""
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    mission = _build_mission_plan_once(
+        model,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        spacing_factor=spacing_factor,
+        max_circular_gap_fraction=max_circular_gap_fraction,
+        circular_stop_backoff_rows=circular_stop_backoff_rows,
+        vertical_spacing_factor=vertical_spacing_factor,
+        overlap_discard_threshold=overlap_discard_threshold,
+        interior_enabled=interior_enabled,
+        profile_config=profile_config,
+        clockwise=clockwise,
+    )
     if not circular_spacing_candidates:
-        return _build_mission_plan_once(
-            model,
-            outer_edge_offset_m=outer_edge_offset_m,
-            row_spacing_m=row_spacing_m,
-            spacing_factor=spacing_factor,
-            max_circular_gap_fraction=max_circular_gap_fraction,
-            circular_stop_backoff_rows=circular_stop_backoff_rows,
-            vertical_spacing_factor=vertical_spacing_factor,
-            overlap_discard_threshold=overlap_discard_threshold,
-            interior_enabled=interior_enabled,
-            profile_config=profile_config,
-            clockwise=clockwise,
-        )
+        return mission
 
-    candidate_missions: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]] = []
-    for row_count in range(DEFAULT_MAX_CIRCULAR_ROWS + 1):
-        try:
-            mission = _build_mission_plan_once(
-                model,
-                outer_edge_offset_m=outer_edge_offset_m,
-                row_spacing_m=row_spacing_m,
-                spacing_factor=spacing_factor,
-                fixed_circular_rows=row_count,
-                max_circular_gap_fraction=max_circular_gap_fraction,
-                circular_stop_backoff_rows=circular_stop_backoff_rows,
-                vertical_spacing_factor=vertical_spacing_factor,
-                overlap_discard_threshold=overlap_discard_threshold,
-                interior_enabled=interior_enabled,
-                profile_config=profile_config,
-                clockwise=clockwise,
-            )
-        except ValueError:
-            continue
-        if len(mission.circular_rows) != row_count:
-            continue
-        coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
-        travel_distance = _estimate_mission_travel_distance(mission.poses)
-        candidate_missions.append((row_count, None, mission, coverage, travel_distance))
-
-    if not candidate_missions:
-        raise ValueError("No valid circular spacing candidates were provided.")
-
-    selected = _select_circular_spacing_candidate(candidate_missions)
-
-    selected_rows, selected_factor, selected_mission, _selected_coverage, _selected_travel = selected
-    candidate_records = [
-        CircularSpacingCandidate(
-            circular_rows=row_count,
-            spacing_factor=factor,
-            coverage_percent=coverage.covered_percent,
-            scan_count=len(mission.poses),
-            travel_distance_m=travel_distance,
-            selected=row_count == selected_rows
-            and (
-                (factor is None and selected_factor is None)
-                or (factor is not None and selected_factor is not None and math.isclose(factor, selected_factor))
-            ),
-        )
-        for row_count, factor, mission, coverage, travel_distance in candidate_missions
-    ]
+    coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
+    candidate_record = CircularSpacingCandidate(
+        circular_rows=len(mission.circular_rows),
+        spacing_factor=None,
+        coverage_percent=coverage.covered_percent,
+        scan_count=len(mission.poses),
+        travel_distance_m=_estimate_mission_travel_distance(mission.poses),
+        selected=True,
+    )
+    row_count = len(mission.circular_rows)
     return replace(
-        selected_mission,
+        mission,
         spacing_factor=spacing_factor,
         selected_circular_spacing_factor=None,
-        circular_spacing_candidates=candidate_records,
-        circular_spacing_selection_reason=_circular_spacing_selection_reason(candidate_records),
-    )
-
-
-def _select_circular_spacing_candidate(
-    candidates: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]],
-) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
-    target_candidates = [
-        candidate for candidate in candidates if candidate[3].covered_percent >= TARGET_COVERAGE_PERCENT
-    ]
-    if not target_candidates:
-        # Keep a verified single circular row when the mission-wide target is
-        # missed, rather than adding a second row solely to chase coverage.
-        # This preserves the established one-row circular strategy while the
-        # independent lawnmower coverage system supplies the interior scans.
-        one_row_candidate = next((candidate for candidate in candidates if candidate[0] == 1), None)
-        if one_row_candidate is not None:
-            return one_row_candidate
-    search_pool = target_candidates if target_candidates else candidates
-    selected = search_pool[0]
-    for candidate in search_pool[1:]:
-        selected = _choose_better_strategy_candidate(selected, candidate, using_target_pool=bool(target_candidates))
-    return selected
-
-
-def _choose_better_strategy_candidate(
-    current: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
-    candidate: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
-    *,
-    using_target_pool: bool,
-) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
-    current_rows, current_factor, current_mission, current_coverage, current_travel = current
-    candidate_rows, candidate_factor, candidate_mission, candidate_coverage, candidate_travel = candidate
-
-    if not using_target_pool:
-        coverage_delta = candidate_coverage.covered_percent - current_coverage.covered_percent
-        if coverage_delta > 0.5:
-            return candidate
-        if coverage_delta < -0.5:
-            return current
-
-    coverage_gain = candidate_coverage.covered_percent - current_coverage.covered_percent
-    scan_savings = len(current_mission.poses) - len(candidate_mission.poses)
-    if coverage_gain > 0.5 and scan_savings > 0:
-        return candidate
-    if coverage_gain < -0.5 and scan_savings < 0:
-        return current
-
-    candidate_key = (
-        candidate_travel,
-        len(candidate_mission.poses),
-        candidate_rows,
-        -(candidate_factor if candidate_factor is not None else 1.0),
-    )
-    current_key = (
-        current_travel,
-        len(current_mission.poses),
-        current_rows,
-        -(current_factor if current_factor is not None else 1.0),
-    )
-    return candidate if candidate_key < current_key else current
-
-
-def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate]) -> str | None:
-    selected = next((candidate for candidate in candidates if candidate.selected), None)
-    if selected is None:
-        return None
-    if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
-        return (
-            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row strategy"
-        )
-    if selected.circular_rows == 1:
-        return (
-            f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; retained one verified circular row "
-            "rather than add a second row solely for coverage"
-        )
-    return (
-        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row coverage"
+        circular_spacing_candidates=[candidate_record],
+        circular_spacing_selection_reason=(
+            f"geometry supports {row_count} usable circular row"
+            f"{'s' if row_count != 1 else ''} (preferred maximum {DEFAULT_MAX_CIRCULAR_ROWS})"
+        ),
     )
 
 
@@ -1365,7 +1313,10 @@ def generate_lawnmower_section_lines(
                 end_m=end,
             )
         )
-    return _add_outer_lawnmower_sections(lines, tank)
+    # The normal planner uses only guide sections derived from the detected
+    # weld geometry.  The experimental outer extensions remain diagnostic-only
+    # and must not participate in normal mission generation.
+    return lines
 
 
 def _add_outer_lawnmower_sections(
