@@ -6,7 +6,10 @@ import numpy as np
 
 from path_planner import (
     LawnmowerSectionLine,
+    TankCircleEstimate,
+    _generate_lawnmower_candidate_lattice,
     estimate_lawnmower_neighbor_overlap_fraction,
+    gate_lawnmower_candidates,
     generate_lawnmower_scan_placements,
     lawnmower_long_side_endpoints,
     lawnmower_scan_profile_polygon,
@@ -140,6 +143,56 @@ class LawnmowerScanPlacementTests(unittest.TestCase):
 
         self.assertEqual(lines, original)
         self.assertTrue(placements)
+
+    def test_candidate_lattice_stays_within_real_guide_endpoints(self):
+        line = _guide(9, "vertical", (0.0, -3.0), (0.0, 3.0))
+
+        candidates = _generate_lawnmower_candidate_lattice([line])
+
+        self.assertTrue(candidates)
+        self.assertGreaterEqual(min(c.projected_position_m for c in candidates), 0.0)
+        self.assertLessEqual(max(c.projected_position_m for c in candidates), 6.0)
+        self.assertTrue(all(c.full_polygon.shape[1] == 2 for c in candidates))
+        self.assertTrue(all(c.left_half_polygon.shape[1] == 2 for c in candidates))
+        self.assertTrue(all(c.right_half_polygon.shape[1] == 2 for c in candidates))
+
+    def test_expected_immediate_neighbor_overlap_is_not_harmful(self):
+        line = _guide(10, "vertical", (0.0, -3.0), (0.0, 3.0))
+        tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
+
+        gating = gate_lawnmower_candidates([line], tank, [])
+        accepted = [
+            candidate
+            for candidate in gating.candidates
+            if candidate.acceptance_result == "accepted_full"
+        ]
+
+        self.assertGreaterEqual(len(accepted), 2)
+        self.assertGreater(
+            accepted[1].full_metrics.expected_neighbor_overlap_area_m2,
+            0.0,
+        )
+        self.assertAlmostEqual(
+            accepted[1].full_metrics.harmful_overlap_area_m2,
+            0.0,
+            places=8,
+        )
+
+    def test_nearly_redundant_duplicate_guide_is_rolled_back(self):
+        first = _guide(11, "vertical", (0.0, -3.0), (0.0, 3.0))
+        second = _guide(12, "vertical", (0.0, -3.0), (0.0, 3.0))
+        tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
+
+        gating = gate_lawnmower_candidates([first, second], tank, [])
+
+        self.assertIn(first.line_id, gating.retained_guide_ids)
+        self.assertIn(second.line_id, gating.discarded_guide_ids)
+        self.assertTrue(
+            all(
+                placement.guide_line_id == first.line_id
+                for placement in gating.placements
+            )
+        )
 
 
 if __name__ == "__main__":

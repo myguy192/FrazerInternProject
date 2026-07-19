@@ -14,7 +14,8 @@ from path_planner import (
     _lawnmower_placements_to_sweep_poses,
     build_outer_edge_sweep_mission,
     determine_max_feasible_circular_rows,
-    generate_lawnmower_scan_placements,
+    estimate_tank_circle_from_geometry,
+    gate_lawnmower_candidates,
     generate_lawnmower_section_lines,
     plot_outer_edge_sweep,
     save_mission_json,
@@ -74,8 +75,13 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
     def test_normal_mission_uses_only_approved_lawnmower_poses_after_circular_stage(self):
         model = _model()
         lines = generate_lawnmower_section_lines(model)
-        placements = generate_lawnmower_scan_placements(lines)
         edge_mission = build_outer_edge_sweep_mission(model, fixed_circular_rows=1)
+        gating_pass = gate_lawnmower_candidates(
+            lines,
+            estimate_tank_circle_from_geometry(model),
+            edge_mission.poses,
+        )
+        placements = gating_pass.placements
         expected_interior = _lawnmower_placements_to_sweep_poses(
             lines,
             placements,
@@ -94,7 +100,10 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
         self.assertEqual(mission.poses[circular_count:], expected_interior)
         self.assertEqual(mission.lawnmower_section_lines, lines)
         self.assertEqual(mission.edge_sweep_scan_count, circular_count)
-        self.assertEqual(mission.interior_discarded_count, 0)
+        self.assertEqual(
+            mission.interior_discarded_count,
+            len(gating_pass.candidates) - len(gating_pass.placements),
+        )
         self.assertEqual(mission.duplicate_poses_removed, 0)
         self.assertFalse(any(pose.stage == "interior_side_guard" for pose in mission.poses))
 

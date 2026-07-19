@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from shapely.geometry.base import BaseGeometry
 
 from dxf_importer import DxfImportError, GeometryModel, import_dxf
 from half_profile_gap_fill import (
@@ -41,6 +42,23 @@ DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
 DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
 DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION = 0.02
+GEOMETRY_EPSILON = 1e-8
+MAX_EXPECTED_NEIGHBOR_OVERLAP_FRACTION = 0.04
+MIN_FULL_INSIDE_FRACTION = 0.80
+MAX_FULL_OUTSIDE_FRACTION = 0.20
+MIN_FULL_NEW_AREA_M2 = 0.08
+MIN_FULL_NEW_FRACTION = 0.30
+MAX_FULL_HARMFUL_OVERLAP_FRACTION = 0.55
+MIN_HALF_INSIDE_FRACTION = 0.80
+MAX_HALF_OUTSIDE_FRACTION = 0.20
+MIN_HALF_NEW_AREA_M2 = 0.05
+MIN_HALF_NEW_FRACTION = 0.25
+MAX_HALF_HARMFUL_OVERLAP_FRACTION = 0.50
+MIN_BURDEN_DOMINANCE = 0.75
+OUTSIDE_BURDEN_WEIGHT = 2.0
+MIN_HALF_SCORE_ADVANTAGE_M2 = 0.05
+MIN_GUIDE_INCREMENTAL_AREA_M2 = 0.08
+MIN_GUIDE_NEW_FRACTION = 0.10
 SIDE_GUARD_HEADING_RAD = math.pi / 2.0
 DEFAULT_JSON_PATH = "mission_plan.json"
 DEFAULT_PLOT_PATH = "mission_preview.png"
@@ -153,6 +171,64 @@ class LawnmowerScanPlacement:
     heading_deg: float
     profile_variant: str = "full"
     parent_profile_origin_m: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class LawnmowerCandidateMetrics:
+    total_area_m2: float
+    inside_area_m2: float
+    outside_area_m2: float
+    inside_fraction: float
+    outside_fraction: float
+    total_overlap_area_m2: float
+    expected_neighbor_overlap_area_m2: float
+    harmful_overlap_area_m2: float
+    harmful_overlap_fraction: float
+    new_area_m2: float
+    new_fraction: float
+
+
+@dataclass(frozen=True)
+class LawnmowerCandidateRecord:
+    candidate_id: int
+    guide_line_id: int
+    guide_order_index: int
+    placement_index: int
+    orientation: str
+    travel_direction: str
+    projected_position_m: float
+    anchor_m: tuple[float, float]
+    profile_origin_m: tuple[float, float]
+    heading_rad: float
+    heading_deg: float
+    full_polygon: np.ndarray
+    left_half_polygon: np.ndarray
+    right_half_polygon: np.ndarray
+    candidate_source: str
+    candidate_stage: str
+    acceptance_result: str = "pending"
+    rejection_reasons: tuple[str, ...] = ()
+    full_metrics: LawnmowerCandidateMetrics | None = None
+    left_half_metrics: LawnmowerCandidateMetrics | None = None
+    right_half_metrics: LawnmowerCandidateMetrics | None = None
+
+
+@dataclass(frozen=True)
+class AcceptedLawnmowerCoverage:
+    guide_line_id: int
+    orientation: str
+    projected_position_m: float
+    profile_variant: str
+    polygon: np.ndarray
+    inside_area_m2: float
+
+
+@dataclass(frozen=True)
+class LawnmowerGatingPass:
+    placements: list[LawnmowerScanPlacement]
+    candidates: list[LawnmowerCandidateRecord]
+    retained_guide_ids: list[int]
+    discarded_guide_ids: list[int]
 
 
 @dataclass(frozen=True)
@@ -1011,13 +1087,8 @@ def _build_mission_plan_once(
         )
 
     guide_lines = generate_lawnmower_section_lines(model)
-    placement_pass = _generate_lawnmower_placement_pass(
+    gating_pass = gate_lawnmower_candidates(
         guide_lines,
-        profile_config=profile_config,
-    )
-    half_salvage = salvage_rejected_lawnmower_candidates(
-        guide_lines,
-        placement_pass,
         TankCircleEstimate(
             center_x=edge_mission.tank_center_m["x"],
             center_y=edge_mission.tank_center_m["y"],
@@ -1029,7 +1100,7 @@ def _build_mission_plan_once(
     )
     lawnmower_poses = _lawnmower_placements_to_sweep_poses(
         guide_lines,
-        placement_pass.accepted + half_salvage.placements,
+        gating_pass.placements,
         scan_id_start=len(edge_mission.poses),
     )
     combined_interior, duplicate_count = _deduplicate_interior_poses(
@@ -1062,12 +1133,20 @@ def _build_mission_plan_once(
         duplicate_poses_removed=duplicate_count,
         invalid_horizontal_segments_skipped=0,
         interior_kept_count=len(combined_interior),
-        interior_discarded_count=0,
+        interior_discarded_count=(
+            len(gating_pass.candidates) - len(gating_pass.placements)
+        ),
         total_scan_count=len(edge_mission.poses) + len(combined_interior),
         poses=edge_mission.poses + combined_interior,
         lawnmower_section_lines=guide_lines,
-        rejected_full_profile_candidate_count=len(placement_pass.rejected),
-        salvaged_half_profile_count=len(half_salvage.placements),
+        rejected_full_profile_candidate_count=sum(
+            candidate.acceptance_result != "accepted_full"
+            for candidate in gating_pass.candidates
+        ),
+        salvaged_half_profile_count=sum(
+            placement.profile_variant in {"left_half", "right_half"}
+            for placement in gating_pass.placements
+        ),
     )
 
 
@@ -1545,6 +1624,473 @@ def _generate_lawnmower_placement_pass(
             placements.append(candidate)
             candidate_id += 1
     return LawnmowerPlacementPass(accepted=placements, rejected=rejected)
+
+
+def _generate_lawnmower_candidate_lattice(
+    lines: list[LawnmowerSectionLine],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+    target_overlap_fraction: float = DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+) -> list[LawnmowerCandidateRecord]:
+    """Generate every unchanged normal-lattice candidate without gating it."""
+    if not 0.0 < target_overlap_fraction < 1.0:
+        raise ValueError("Lawnmower neighbor overlap fraction must be between 0 and 1.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    halves = make_rainbow_profile_halves(profile_config)
+    local_profile = halves.full_polygon
+    local_anchor = np.asarray(halves.long_side_anchor_m, dtype=float)
+    target_step = _lawnmower_spacing_for_overlap(local_profile, target_overlap_fraction)
+    ordered_lines = sorted(
+        lines,
+        key=lambda line: (
+            0 if line.orientation == "vertical" else 1,
+            line.order_index,
+            line.line_id,
+        ),
+    )
+    records: list[LawnmowerCandidateRecord] = []
+    for line in ordered_lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length <= SECTION_MIN_LENGTH_M:
+            continue
+        direction = delta / length
+        heading_rad = _normalize_angle(math.atan2(direction[1], direction[0]) - math.pi / 2.0)
+        canonical_start, canonical_direction = _canonical_lawnmower_line_reference(start, end)
+        anchor_distances = _lawnmower_anchor_distances(
+            length,
+            local_profile,
+            local_anchor,
+            target_step,
+        )
+        anchor_points = [
+            canonical_start + canonical_direction * distance_m
+            for distance_m in anchor_distances
+        ]
+        if float(np.dot(direction, canonical_direction)) < 0.0:
+            anchor_points.reverse()
+        travel_direction = _line_travel_direction(direction)
+        rotation = np.array(
+            [
+                [math.cos(heading_rad), -math.sin(heading_rad)],
+                [math.sin(heading_rad), math.cos(heading_rad)],
+            ],
+            dtype=float,
+        )
+        for placement_index, anchor in enumerate(anchor_points):
+            profile_origin = anchor - local_anchor @ rotation.T
+            x_m = float(profile_origin[0])
+            y_m = float(profile_origin[1])
+            records.append(
+                LawnmowerCandidateRecord(
+                    candidate_id=len(records),
+                    guide_line_id=line.line_id,
+                    guide_order_index=line.order_index,
+                    placement_index=placement_index,
+                    orientation=line.orientation,
+                    travel_direction=travel_direction,
+                    projected_position_m=float(np.dot(anchor - start, direction)),
+                    anchor_m=(float(anchor[0]), float(anchor[1])),
+                    profile_origin_m=(x_m, y_m),
+                    heading_rad=heading_rad,
+                    heading_deg=math.degrees(heading_rad),
+                    full_polygon=transform_profile(local_profile, x_m, y_m, heading_rad),
+                    left_half_polygon=transform_rainbow_half(
+                        halves.left_half,
+                        x_m,
+                        y_m,
+                        heading_rad,
+                    ),
+                    right_half_polygon=transform_rainbow_half(
+                        halves.right_half,
+                        x_m,
+                        y_m,
+                        heading_rad,
+                    ),
+                    candidate_source="normal_lattice",
+                    candidate_stage=(
+                        "interior_vertical"
+                        if line.orientation == "vertical"
+                        else "interior_horizontal"
+                    ),
+                )
+            )
+    return records
+
+
+def _exact_lawnmower_candidate_metrics(
+    candidate_polygon: np.ndarray,
+    valid_region: BaseGeometry,
+    existing_coverage: BaseGeometry,
+    immediate_neighbor: AcceptedLawnmowerCoverage | None,
+) -> LawnmowerCandidateMetrics:
+    candidate = as_polygon(candidate_polygon)
+    total_area = float(candidate.area)
+    if total_area <= GEOMETRY_EPSILON:
+        return LawnmowerCandidateMetrics(
+            total_area_m2=total_area,
+            inside_area_m2=0.0,
+            outside_area_m2=0.0,
+            inside_fraction=0.0,
+            outside_fraction=0.0,
+            total_overlap_area_m2=0.0,
+            expected_neighbor_overlap_area_m2=0.0,
+            harmful_overlap_area_m2=0.0,
+            harmful_overlap_fraction=0.0,
+            new_area_m2=0.0,
+            new_fraction=0.0,
+        )
+    inside_polygon = candidate.intersection(valid_region)
+    outside_polygon = candidate.difference(valid_region)
+    total_overlap_polygon = inside_polygon.intersection(existing_coverage)
+    new_polygon = inside_polygon.difference(existing_coverage)
+    inside_area = float(inside_polygon.area)
+    outside_area = float(outside_polygon.area)
+    total_overlap_area = float(total_overlap_polygon.area)
+    new_area = float(new_polygon.area)
+    allowed_neighbor_overlap = 0.0
+    if immediate_neighbor is not None:
+        actual_neighbor_overlap = float(
+            inside_polygon.intersection(as_polygon(immediate_neighbor.polygon)).area
+        )
+        allowed_neighbor_overlap = min(
+            actual_neighbor_overlap,
+            MAX_EXPECTED_NEIGHBOR_OVERLAP_FRACTION
+            * min(inside_area, immediate_neighbor.inside_area_m2),
+        )
+    harmful_overlap_area = max(0.0, total_overlap_area - allowed_neighbor_overlap)
+    return LawnmowerCandidateMetrics(
+        total_area_m2=total_area,
+        inside_area_m2=inside_area,
+        outside_area_m2=outside_area,
+        inside_fraction=inside_area / max(total_area, GEOMETRY_EPSILON),
+        outside_fraction=outside_area / max(total_area, GEOMETRY_EPSILON),
+        total_overlap_area_m2=total_overlap_area,
+        expected_neighbor_overlap_area_m2=allowed_neighbor_overlap,
+        harmful_overlap_area_m2=harmful_overlap_area,
+        harmful_overlap_fraction=harmful_overlap_area / max(inside_area, GEOMETRY_EPSILON),
+        new_area_m2=new_area,
+        new_fraction=new_area / max(inside_area, GEOMETRY_EPSILON),
+    )
+
+
+def _full_candidate_rejection_reasons(
+    candidate: LawnmowerCandidateRecord,
+    metrics: LawnmowerCandidateMetrics,
+    accepted_placements: list[LawnmowerScanPlacement],
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    geometry = as_polygon(candidate.full_polygon)
+    if (
+        not math.isfinite(candidate.heading_rad)
+        or not bool(np.all(np.isfinite(candidate.full_polygon)))
+        or geometry.is_empty
+        or not geometry.is_valid
+        or metrics.total_area_m2 <= GEOMETRY_EPSILON
+    ):
+        reasons.append("invalid_geometry")
+    if (
+        metrics.inside_fraction < MIN_FULL_INSIDE_FRACTION
+        or metrics.outside_fraction > MAX_FULL_OUTSIDE_FRACTION
+    ):
+        reasons.append("outside_valid_region")
+    if metrics.new_area_m2 < MIN_FULL_NEW_AREA_M2:
+        reasons.append("insufficient_new_area")
+    if metrics.new_fraction < MIN_FULL_NEW_FRACTION:
+        reasons.append("insufficient_new_fraction")
+    if metrics.harmful_overlap_fraction > MAX_FULL_HARMFUL_OVERLAP_FRACTION:
+        reasons.append("excessive_harmful_overlap")
+    hypothetical = _placement_from_lawnmower_candidate(
+        candidate,
+        profile_variant="full",
+        placement_id=-1,
+    )
+    if _is_effectively_duplicate_lawnmower_placement(hypothetical, accepted_placements):
+        reasons.append("duplicate_pose")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _half_metrics_pass(metrics: LawnmowerCandidateMetrics) -> bool:
+    return (
+        metrics.inside_fraction >= MIN_HALF_INSIDE_FRACTION
+        and metrics.outside_fraction <= MAX_HALF_OUTSIDE_FRACTION
+        and metrics.new_area_m2 >= MIN_HALF_NEW_AREA_M2
+        and metrics.new_fraction >= MIN_HALF_NEW_FRACTION
+        and metrics.harmful_overlap_fraction <= MAX_HALF_HARMFUL_OVERLAP_FRACTION
+    )
+
+
+def _select_salvaged_half(
+    rejection_reasons: tuple[str, ...],
+    left_metrics: LawnmowerCandidateMetrics,
+    right_metrics: LawnmowerCandidateMetrics,
+) -> tuple[str | None, str]:
+    reasons = set(rejection_reasons)
+    if reasons & {"invalid_geometry", "duplicate_pose"}:
+        return None, "non_salvageable_rejection"
+    salvageable = {
+        "outside_valid_region",
+        "excessive_harmful_overlap",
+        "insufficient_new_area",
+        "insufficient_new_fraction",
+    }
+    if not reasons or not reasons.issubset(salvageable):
+        return None, "non_salvageable_rejection"
+
+    insufficient_reasons = {"insufficient_new_area", "insufficient_new_fraction"}
+    if reasons & insufficient_reasons:
+        combined_new_area = left_metrics.new_area_m2 + right_metrics.new_area_m2
+        useful_concentration = max(
+            left_metrics.new_area_m2,
+            right_metrics.new_area_m2,
+        ) / max(combined_new_area, GEOMETRY_EPSILON)
+        if useful_concentration < MIN_BURDEN_DOMINANCE:
+            return None, "useful_new_area_not_one_sided"
+
+    left_burden = (
+        left_metrics.harmful_overlap_area_m2
+        + OUTSIDE_BURDEN_WEIGHT * left_metrics.outside_area_m2
+    )
+    right_burden = (
+        right_metrics.harmful_overlap_area_m2
+        + OUTSIDE_BURDEN_WEIGHT * right_metrics.outside_area_m2
+    )
+    combined_burden = left_burden + right_burden
+    dominant_burden_share = max(left_burden, right_burden) / max(
+        combined_burden,
+        GEOMETRY_EPSILON,
+    )
+    if dominant_burden_share < MIN_BURDEN_DOMINANCE:
+        return None, "burden_not_one_sided"
+
+    passing = [
+        variant
+        for variant, metrics in (
+            ("left_half", left_metrics),
+            ("right_half", right_metrics),
+        )
+        if _half_metrics_pass(metrics)
+    ]
+    if len(passing) == 0:
+        return None, "neither_half_passes"
+    if len(passing) == 1:
+        return passing[0], f"accepted_{passing[0]}"
+
+    scores = {
+        "left_half": (
+            left_metrics.new_area_m2
+            - left_metrics.harmful_overlap_area_m2
+            - OUTSIDE_BURDEN_WEIGHT * left_metrics.outside_area_m2
+        ),
+        "right_half": (
+            right_metrics.new_area_m2
+            - right_metrics.harmful_overlap_area_m2
+            - OUTSIDE_BURDEN_WEIGHT * right_metrics.outside_area_m2
+        ),
+    }
+    higher = max(scores, key=scores.get)
+    lower = "right_half" if higher == "left_half" else "left_half"
+    if scores[higher] - scores[lower] >= MIN_HALF_SCORE_ADVANTAGE_M2:
+        return higher, f"accepted_{higher}"
+    return None, "ambiguous_halves"
+
+
+def _placement_from_lawnmower_candidate(
+    candidate: LawnmowerCandidateRecord,
+    *,
+    profile_variant: str,
+    placement_id: int,
+) -> LawnmowerScanPlacement:
+    return LawnmowerScanPlacement(
+        placement_id=placement_id,
+        guide_line_id=candidate.guide_line_id,
+        guide_order_index=candidate.guide_order_index,
+        placement_index=candidate.placement_index,
+        orientation=candidate.orientation,
+        travel_direction=candidate.travel_direction,
+        anchor_m=candidate.anchor_m,
+        profile_origin_m=candidate.profile_origin_m,
+        heading_rad=candidate.heading_rad,
+        heading_deg=candidate.heading_deg,
+        profile_variant=profile_variant,
+        parent_profile_origin_m=(
+            candidate.profile_origin_m if profile_variant != "full" else None
+        ),
+    )
+
+
+def gate_lawnmower_candidates(
+    lines: list[LawnmowerSectionLine],
+    tank: TankCircleEstimate,
+    edge_poses: list[SweepPose],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> LawnmowerGatingPass:
+    """Apply the single authoritative full/half exact-geometry gate."""
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    halves = make_rainbow_profile_halves(profile_config)
+    local_profile = halves.full_polygon
+    local_anchor = np.asarray(halves.long_side_anchor_m, dtype=float)
+    target_step = _lawnmower_spacing_for_overlap(
+        local_profile,
+        DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+    )
+    candidates = _generate_lawnmower_candidate_lattice(
+        lines,
+        profile_config=profile_config,
+    )
+    candidates_by_guide: dict[int, list[LawnmowerCandidateRecord]] = {}
+    for candidate in candidates:
+        candidates_by_guide.setdefault(candidate.guide_line_id, []).append(candidate)
+
+    circular_polygons = [
+        polygon
+        for polygon, _bounds in _circular_edge_polygon_records(local_profile, edge_poses)
+    ]
+    coverage = polygon_union(circular_polygons)
+    accepted_placements: list[LawnmowerScanPlacement] = []
+    evaluated_candidates: list[LawnmowerCandidateRecord] = []
+    retained_guide_ids: list[int] = []
+    discarded_guide_ids: list[int] = []
+    ordered_lines = sorted(
+        lines,
+        key=lambda line: (
+            0 if line.orientation == "vertical" else 1,
+            line.order_index,
+            line.line_id,
+        ),
+    )
+    for line in ordered_lines:
+        coverage_before_guide = coverage
+        guide_placements: list[LawnmowerScanPlacement] = []
+        guide_polygons: list[np.ndarray] = []
+        guide_candidate_indices: list[int] = []
+        immediate_neighbor: AcceptedLawnmowerCoverage | None = None
+        valid_region = build_candidate_valid_region(
+            line.start_m,
+            line.end_m,
+            (tank.center_x, tank.center_y),
+            tank.radius,
+            local_profile,
+            local_anchor,
+            target_step,
+        )
+        for candidate in candidates_by_guide.get(line.line_id, []):
+            full_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.full_polygon,
+                valid_region,
+                coverage,
+                immediate_neighbor,
+            )
+            left_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.left_half_polygon,
+                valid_region,
+                coverage,
+                immediate_neighbor,
+            )
+            right_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.right_half_polygon,
+                valid_region,
+                coverage,
+                immediate_neighbor,
+            )
+            reasons = _full_candidate_rejection_reasons(
+                candidate,
+                full_metrics,
+                accepted_placements + guide_placements,
+            )
+            selected_variant: str | None = None
+            result = "rejected_full"
+            if not reasons:
+                selected_variant = "full"
+                result = "accepted_full"
+            else:
+                selected_variant, result = _select_salvaged_half(
+                    reasons,
+                    left_metrics,
+                    right_metrics,
+                )
+
+            evaluated = replace(
+                candidate,
+                acceptance_result=result,
+                rejection_reasons=reasons,
+                full_metrics=full_metrics,
+                left_half_metrics=left_metrics,
+                right_half_metrics=right_metrics,
+            )
+            evaluated_candidates.append(evaluated)
+            guide_candidate_indices.append(len(evaluated_candidates) - 1)
+            if selected_variant is None:
+                continue
+
+            placement = _placement_from_lawnmower_candidate(
+                candidate,
+                profile_variant=selected_variant,
+                placement_id=len(accepted_placements) + len(guide_placements),
+            )
+            selected_polygon = {
+                "full": candidate.full_polygon,
+                "left_half": candidate.left_half_polygon,
+                "right_half": candidate.right_half_polygon,
+            }[selected_variant]
+            selected_metrics = {
+                "full": full_metrics,
+                "left_half": left_metrics,
+                "right_half": right_metrics,
+            }[selected_variant]
+            guide_placements.append(placement)
+            guide_polygons.append(selected_polygon)
+            coverage = coverage.union(as_polygon(selected_polygon))
+            immediate_neighbor = AcceptedLawnmowerCoverage(
+                guide_line_id=line.line_id,
+                orientation=line.orientation,
+                projected_position_m=candidate.projected_position_m,
+                profile_variant=selected_variant,
+                polygon=selected_polygon,
+                inside_area_m2=selected_metrics.inside_area_m2,
+            )
+
+        guide_union = polygon_union(guide_polygons)
+        guide_incremental_area = float(guide_union.difference(coverage_before_guide).area)
+        guide_new_fraction = guide_incremental_area / max(
+            float(guide_union.area),
+            GEOMETRY_EPSILON,
+        )
+        retain_guide = (
+            bool(guide_placements)
+            and guide_incremental_area >= MIN_GUIDE_INCREMENTAL_AREA_M2
+            and guide_new_fraction >= MIN_GUIDE_NEW_FRACTION
+        )
+        if retain_guide:
+            retained_guide_ids.append(line.line_id)
+            accepted_placements.extend(guide_placements)
+        else:
+            discarded_guide_ids.append(line.line_id)
+            coverage = coverage_before_guide
+            for candidate_index in guide_candidate_indices:
+                evaluated = evaluated_candidates[candidate_index]
+                if evaluated.acceptance_result.startswith("accepted_"):
+                    evaluated_candidates[candidate_index] = replace(
+                        evaluated,
+                        acceptance_result="guide_discarded",
+                        rejection_reasons=evaluated.rejection_reasons
+                        + ("guide_insufficient_incremental_coverage",),
+                    )
+
+    accepted_placements = [
+        replace(placement, placement_id=index)
+        for index, placement in enumerate(accepted_placements)
+    ]
+    return LawnmowerGatingPass(
+        placements=accepted_placements,
+        candidates=evaluated_candidates,
+        retained_guide_ids=retained_guide_ids,
+        discarded_guide_ids=discarded_guide_ids,
+    )
 
 
 def salvage_rejected_lawnmower_candidates(
