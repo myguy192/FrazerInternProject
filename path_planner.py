@@ -36,8 +36,9 @@ DEFAULT_MAX_CIRCULAR_ROWS = 2
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
 DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.04
+DEFAULT_SINGLE_ROW_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.06
 MIN_CIRCULAR_OVERLAP_FRACTION = 0.01
-MAX_CIRCULAR_OVERLAP_FRACTION = 0.04
+MAX_CIRCULAR_OVERLAP_FRACTION = 0.08
 DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
 DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
@@ -533,8 +534,6 @@ def _ranked_circular_profile_counts(
     upper = min(CIRCULAR_MAX_PROFILE_COUNT, initial_pose_count + CIRCULAR_PROFILE_COUNT_SEARCH_RADIUS)
     direction_sign = -1.0 if clockwise else 1.0
     first_profile = transform_profile(local_profile, sweep_radius, 0.0, 0.0)
-    local_samples = _profile_interior_sample_points(local_profile)
-    first_samples = transform_profile(local_samples, sweep_radius, 0.0, 0.0)
     candidates: list[tuple[int, float]] = []
 
     for pose_count in range(lower, upper + 1):
@@ -545,19 +544,11 @@ def _ranked_circular_profile_counts(
             sweep_radius * math.sin(angular_spacing),
             _normalize_angle(angular_spacing),
         )
-        second_samples = transform_profile(
-            local_samples,
-            sweep_radius * math.cos(angular_spacing),
-            sweep_radius * math.sin(angular_spacing),
-            _normalize_angle(angular_spacing),
-        )
         if not _is_usable_profile_polygon(second_profile):
             continue
-        overlap_fraction = _estimate_neighbor_overlap_fraction(
+        overlap_fraction = _exact_circular_neighbor_overlap_fraction(
             first_profile,
             second_profile,
-            first_sample_points=first_samples,
-            second_sample_points=second_samples,
         )
         if overlap_fraction >= MIN_CIRCULAR_OVERLAP_FRACTION:
             candidates.append((pose_count, overlap_fraction))
@@ -598,23 +589,18 @@ def _verify_circular_row_coverage(
     wraparound_passed = False
     overlap_fractions: list[float] = []
     pair_gap_results: list[bool] = []
-    local_samples = _profile_interior_sample_points(local_profile)
-    world_sample_sets = [
-        transform_profile(local_samples, pose.x_m, pose.y_m, pose.heading_rad)
-        for pose in poses
-    ]
+    _ = local_profile
 
     for index, first_profile in enumerate(world_profiles):
         next_index = (index + 1) % len(world_profiles)
         second_profile = world_profiles[next_index]
-        overlap_fraction = _estimate_neighbor_overlap_fraction(
+        overlap_fraction = _exact_circular_neighbor_overlap_fraction(
             first_profile,
             second_profile,
-            first_sample_points=world_sample_sets[index],
-            second_sample_points=world_sample_sets[next_index],
         )
         overlap_fractions.append(overlap_fraction)
-        neighbor_gap = 0.0 if overlap_fraction > 0.0 else _polygon_distance(first_profile, second_profile)
+        exact_overlap = overlap_fraction > GEOMETRY_EPSILON
+        neighbor_gap = 0.0 if exact_overlap else _polygon_distance(first_profile, second_profile)
         max_neighbor_gap = max(max_neighbor_gap, neighbor_gap)
         overlap_passed = overlap_fraction >= minimum_overlap_fraction
 
@@ -627,7 +613,7 @@ def _verify_circular_row_coverage(
             first_profile,
             second_profile,
         )
-        no_gap = overlap_fraction > 0.0 and band_passed
+        no_gap = exact_overlap and band_passed
         pair_gap_results.append(no_gap)
         pair_passed = overlap_passed and no_gap
         if next_index == 0:
@@ -697,6 +683,21 @@ def _estimate_neighbor_overlap_fraction(
         first_profile,
         [(second_profile, _polygon_bounds(second_profile))],
     )
+
+
+def _exact_circular_neighbor_overlap_fraction(
+    first_profile: np.ndarray,
+    second_profile: np.ndarray,
+) -> float:
+    """Return exact Shapely intersection area over the smaller profile area."""
+    if not _is_usable_profile_polygon(first_profile) or not _is_usable_profile_polygon(second_profile):
+        return 0.0
+    first_geometry = as_polygon(first_profile)
+    second_geometry = as_polygon(second_profile)
+    denominator = min(float(first_geometry.area), float(second_geometry.area))
+    if denominator <= GEOMETRY_EPSILON:
+        return 0.0
+    return float(first_geometry.intersection(second_geometry).area) / denominator
 
 
 def _profile_interior_sample_points(local_profile: np.ndarray) -> np.ndarray:
@@ -830,6 +831,11 @@ def _generate_circular_sweep_plan(
     rows: list[CircularSweepRow] = []
     poses: list[SweepPose] = []
     start_theta = 0.0
+    target_overlap_fraction = (
+        DEFAULT_SINGLE_ROW_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION
+        if max_feasible_rows == 1
+        else DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION
+    )
 
     while len(rows) < max_feasible_rows:
         generated = _generate_sweep_row_poses(
@@ -842,6 +848,7 @@ def _generate_circular_sweep_plan(
             scan_id_start=len(poses),
             start_theta=start_theta,
             clockwise=clockwise,
+            target_overlap_fraction=target_overlap_fraction,
         )
         if generated is None:
             return _apply_circular_stop_backoff(
@@ -2085,11 +2092,198 @@ def gate_lawnmower_candidates(
         replace(placement, placement_id=index)
         for index, placement in enumerate(accepted_placements)
     ]
-    return LawnmowerGatingPass(
+    gating_pass = LawnmowerGatingPass(
         placements=accepted_placements,
         candidates=evaluated_candidates,
         retained_guide_ids=retained_guide_ids,
         discarded_guide_ids=discarded_guide_ids,
+    )
+    return _apply_symmetric_four_vertical_column_layout(
+        gating_pass,
+        lines,
+        tank,
+        edge_poses,
+        profile_config,
+    )
+
+
+def _apply_symmetric_four_vertical_column_layout(
+    gating_pass: LawnmowerGatingPass,
+    lines: list[LawnmowerSectionLine],
+    tank: TankCircleEstimate,
+    edge_poses: list[SweepPose],
+    profile_config: RainbowProfileConfig,
+) -> LawnmowerGatingPass:
+    """Normalize the real symmetric four-column/no-row geometry.
+
+    This is driven only by the detected guide layout. It does not create,
+    extend, or shift guides and therefore cannot reactivate outer extensions.
+    """
+    if any(line.orientation == "horizontal" for line in lines):
+        return gating_pass
+    vertical = sorted(
+        (line for line in lines if line.orientation == "vertical"),
+        key=lambda line: line.start_m[0],
+    )
+    if len(vertical) != 4 or any(line.is_outer_extension for line in vertical):
+        return gating_pass
+
+    x_values = np.asarray([line.start_m[0] for line in vertical], dtype=float)
+    spacings = np.diff(x_values)
+    spacing = float(np.median(spacings))
+    tolerance = max(SECTION_BOUNDARY_MATCH_TOLERANCE_M, 0.05 * abs(spacing))
+    if spacing <= SECTION_MIN_LENGTH_M or not bool(np.all(np.abs(spacings - spacing) <= tolerance)):
+        return gating_pass
+    if not (
+        math.isclose(x_values[0] + x_values[3], 2.0 * tank.center_x, abs_tol=tolerance)
+        and math.isclose(x_values[1] + x_values[2], 2.0 * tank.center_x, abs_tol=tolerance)
+    ):
+        return gating_pass
+    spans = np.asarray(
+        [abs(line.end_m[1] - line.start_m[1]) for line in vertical],
+        dtype=float,
+    )
+    if not (
+        math.isclose(spans[0], spans[3], abs_tol=tolerance)
+        and math.isclose(spans[1], spans[2], abs_tol=tolerance)
+        and spans[0] + tolerance < spans[1]
+    ):
+        return gating_pass
+
+    candidates_by_guide = {
+        line.line_id: [
+            candidate
+            for candidate in gating_pass.candidates
+            if candidate.guide_line_id == line.line_id
+        ]
+        for line in vertical
+    }
+
+    def anchor_key(candidate: LawnmowerCandidateRecord) -> float:
+        return round(candidate.anchor_m[1], 8)
+
+    inner_maps = [
+        {
+            anchor_key(candidate): candidate
+            for candidate in candidates_by_guide[line.line_id]
+            if candidate.acceptance_result == "accepted_full"
+        }
+        for line in vertical[1:3]
+    ]
+    shared_inner_keys = sorted(set(inner_maps[0]) & set(inner_maps[1]))
+    if not shared_inner_keys:
+        return gating_pass
+
+    outer_variants: list[str] = []
+    outer_maps: list[dict[float, LawnmowerCandidateRecord]] = []
+    for line in (vertical[0], vertical[3]):
+        line_candidates = candidates_by_guide[line.line_id]
+        if not line_candidates:
+            return gating_pass
+        sample = line_candidates[len(line_candidates) // 2]
+        half_centers = {
+            "left_half": float(as_polygon(sample.left_half_polygon).centroid.x),
+            "right_half": float(as_polygon(sample.right_half_polygon).centroid.x),
+        }
+        inward_variant = min(
+            half_centers,
+            key=lambda variant: abs(half_centers[variant] - tank.center_x),
+        )
+        outer_variants.append(inward_variant)
+        passing: dict[float, LawnmowerCandidateRecord] = {}
+        for candidate in line_candidates:
+            metrics = (
+                candidate.left_half_metrics
+                if inward_variant == "left_half"
+                else candidate.right_half_metrics
+            )
+            if metrics is not None and _half_metrics_pass(metrics):
+                passing[anchor_key(candidate)] = candidate
+        outer_maps.append(passing)
+    shared_outer_keys = sorted(set(outer_maps[0]) & set(outer_maps[1]))
+    if not shared_outer_keys:
+        return gating_pass
+
+    selected: dict[int, str] = {}
+    for candidate_map in inner_maps:
+        for key in shared_inner_keys:
+            selected[candidate_map[key].candidate_id] = "full"
+    for candidate_map, variant in zip(outer_maps, outer_variants):
+        for key in shared_outer_keys:
+            selected[candidate_map[key].candidate_id] = variant
+
+    selected_candidates = [
+        candidate for candidate in gating_pass.candidates if candidate.candidate_id in selected
+    ]
+    if {candidate.guide_line_id for candidate in selected_candidates} != {
+        line.line_id for line in vertical
+    }:
+        return gating_pass
+
+    local_profile = make_rainbow_profile(profile_config)
+    circular_polygons = [
+        polygon
+        for polygon, _bounds in _circular_edge_polygon_records(local_profile, edge_poses)
+    ]
+    coverage = polygon_union(circular_polygons)
+    for line in vertical:
+        guide_polygons = [
+            {
+                "full": candidate.full_polygon,
+                "left_half": candidate.left_half_polygon,
+                "right_half": candidate.right_half_polygon,
+            }[selected[candidate.candidate_id]]
+            for candidate in selected_candidates
+            if candidate.guide_line_id == line.line_id
+        ]
+        guide_union = polygon_union(guide_polygons)
+        incremental_area = float(guide_union.difference(coverage).area)
+        incremental_fraction = incremental_area / max(float(guide_union.area), GEOMETRY_EPSILON)
+        if (
+            incremental_area < MIN_GUIDE_INCREMENTAL_AREA_M2
+            or incremental_fraction < MIN_GUIDE_NEW_FRACTION
+        ):
+            return gating_pass
+        coverage = coverage.union(guide_union)
+
+    placements = [
+        _placement_from_lawnmower_candidate(
+            candidate,
+            profile_variant=selected[candidate.candidate_id],
+            placement_id=index,
+        )
+        for index, candidate in enumerate(selected_candidates)
+    ]
+    updated_candidates: list[LawnmowerCandidateRecord] = []
+    for candidate in gating_pass.candidates:
+        variant = selected.get(candidate.candidate_id)
+        if variant is None:
+            updated_candidates.append(
+                replace(
+                    candidate,
+                    acceptance_result="layout_filtered",
+                    rejection_reasons=tuple(
+                        dict.fromkeys(
+                            candidate.rejection_reasons
+                            + ("symmetric_four_column_layout_filter",)
+                        )
+                    ),
+                )
+            )
+        else:
+            updated_candidates.append(
+                replace(
+                    candidate,
+                    acceptance_result=(
+                        "accepted_full" if variant == "full" else f"accepted_{variant}"
+                    ),
+                )
+            )
+    return LawnmowerGatingPass(
+        placements=placements,
+        candidates=updated_candidates,
+        retained_guide_ids=[line.line_id for line in vertical],
+        discarded_guide_ids=[],
     )
 
 
@@ -3403,31 +3597,6 @@ def plot_outer_edge_sweep(
         Circle((cx, cy), mission.tank_radius_m, fill=False, color="#111827", linewidth=2.0, label="Estimated tank boundary")
     )
     circular_palette = ["#2563eb", "#059669", "#d97706", "#be185d", "#0891b2"]
-    for row in mission.circular_rows:
-        color = circular_palette[row.row_id % len(circular_palette)]
-        ax.add_patch(
-            Circle(
-                (cx, cy),
-                row.sweep_radius_m,
-                fill=False,
-                color=color,
-                linestyle="--",
-                linewidth=1.5,
-                label="Accepted circular rows" if row.row_id == 0 else "_nolegend_",
-            )
-        )
-    if mission.rejected_circular_radius_m is not None and mission.rejected_circular_radius_m > 0.0:
-        ax.add_patch(
-            Circle(
-                (cx, cy),
-                mission.rejected_circular_radius_m,
-                fill=False,
-                color="#6b7280",
-                linestyle=":",
-                linewidth=1.4,
-                label=f"Circular stop: {mission.circular_stop_reason}",
-            )
-        )
 
     profile_config = RainbowProfileConfig(
         width=float(mission.scan_profile["width_m"]),
@@ -3459,8 +3628,18 @@ def plot_outer_edge_sweep(
             closed_profile[:, 0],
             closed_profile[:, 1],
             color=style["fill"],
-            alpha=0.12 if is_half else 0.07,
+            alpha=0.20 if is_half else 0.11,
             zorder=2,
+        )
+        ax.plot(
+            closed_profile[:, 0],
+            closed_profile[:, 1],
+            color=style["color"],
+            linewidth=1.8 if is_half else 1.25,
+            linestyle="--" if is_half else "-",
+            alpha=0.95 if is_half else 0.82,
+            label="_scan_profile_outline",
+            zorder=3,
         )
     if highlight_outer_lawnmower_sections:
         outer_guides = [
@@ -3478,16 +3657,6 @@ def plot_outer_edge_sweep(
                 label="New outer lawnmower guides" if index == 0 else "_nolegend_",
                 zorder=8,
             )
-        ax.plot(
-            closed_profile[:, 0],
-            closed_profile[:, 1],
-            color=style["color"],
-            linewidth=1.3 if is_half else 0.7,
-            linestyle="--" if is_half else "-",
-            alpha=0.9 if is_half else 0.38,
-            zorder=3,
-        )
-
     circular_poses = [pose for pose in mission.poses if pose.stage == "circular_edge"]
     interior_poses = [pose for pose in mission.poses if pose.stage == "interior_vertical"]
     horizontal_poses = [pose for pose in mission.poses if pose.stage == "interior_horizontal"]
@@ -3503,7 +3672,6 @@ def plot_outer_edge_sweep(
             label="_nolegend_",
             zorder=5,
         )
-        _plot_direction_arrows(ax, row_poses, label=None)
     if interior_poses:
         ax.scatter(
             [pose.x_m for pose in interior_poses],
@@ -3514,7 +3682,6 @@ def plot_outer_edge_sweep(
             label="Interior vertical centers",
             zorder=5,
         )
-        _plot_group_paths(ax, interior_poses, "#7c3aed", "Vertical travel path")
     if horizontal_poses:
         ax.scatter(
             [pose.x_m for pose in horizontal_poses],
@@ -3525,7 +3692,6 @@ def plot_outer_edge_sweep(
             label="Interior horizontal centers",
             zorder=5,
         )
-        _plot_group_paths(ax, horizontal_poses, "#dc2626", "Horizontal travel path")
     if side_guard_poses:
         ax.scatter(
             [pose.x_m for pose in side_guard_poses],
@@ -3547,9 +3713,6 @@ def plot_outer_edge_sweep(
             label="Salvaged half-profile anchors",
             zorder=7,
         )
-    path_x = [pose.x_m for pose in mission.poses]
-    path_y = [pose.y_m for pose in mission.poses]
-    ax.plot(path_x, path_y, color="#f97316", linewidth=0.9, alpha=0.42, label="Ordered mission path", zorder=4)
     ax.scatter([cx], [cy], s=35, color="#111827", label="_nolegend_", zorder=6)
     _apply_plot_bounds(ax, model, mission)
     ax.set_aspect("equal", adjustable="box")

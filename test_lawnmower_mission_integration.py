@@ -5,12 +5,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import matplotlib
+from matplotlib.quiver import Quiver
+from matplotlib.patches import Circle
+from shapely.geometry import Polygon
 
 matplotlib.use("Agg")
 
-from dxf_importer import Bounds, GeometryModel, LineSegment, Point2D
+from dxf_importer import Bounds, GeometryModel, LineSegment, Point2D, import_dxf
 from path_planner import (
+    MIN_CIRCULAR_OVERLAP_FRACTION,
     _build_mission_plan_once,
+    _exact_circular_neighbor_overlap_fraction,
     _lawnmower_placements_to_sweep_poses,
     build_outer_edge_sweep_mission,
     determine_max_feasible_circular_rows,
@@ -18,6 +23,7 @@ from path_planner import (
     gate_lawnmower_candidates,
     generate_lawnmower_section_lines,
     plot_outer_edge_sweep,
+    scan_pose_profile_polygon,
     save_mission_json,
 )
 
@@ -42,6 +48,61 @@ def _model():
 
 
 class LawnmowerMissionIntegrationTests(unittest.TestCase):
+    def test_24ft_uses_one_stronger_circular_row_and_four_symmetric_vertical_columns(self):
+        model = import_dxf(Path("3 Tank examples") / "24ft.dxf")
+
+        mission = _build_mission_plan_once(model)
+        vertical_lines = [
+            line
+            for line in mission.lawnmower_section_lines
+            if line.orientation == "vertical"
+        ]
+        horizontal_lines = [
+            line
+            for line in mission.lawnmower_section_lines
+            if line.orientation == "horizontal"
+        ]
+
+        self.assertEqual(len(mission.circular_rows), 1)
+        self.assertEqual(mission.circular_rows[0].scan_count, 35)
+        self.assertGreater(mission.circular_rows[0].minimum_neighbor_overlap_fraction, 0.055)
+        self.assertEqual(horizontal_lines, [])
+        self.assertEqual(mission.horizontal_scan_count, 0)
+        self.assertEqual(len(vertical_lines), 4)
+        self.assertFalse(any(line.is_outer_extension for line in vertical_lines))
+
+        ordered_lines = sorted(vertical_lines, key=lambda line: line.start_m[0])
+        x_values = [line.start_m[0] for line in ordered_lines]
+        self.assertAlmostEqual(x_values[1] - x_values[0], x_values[2] - x_values[1], places=9)
+        self.assertAlmostEqual(x_values[2] - x_values[1], x_values[3] - x_values[2], places=9)
+        poses_by_guide = {
+            line.line_id: [
+                pose
+                for pose in mission.poses
+                if pose.stage == "interior_vertical" and pose.section_id == line.line_id
+            ]
+            for line in ordered_lines
+        }
+        for line in (ordered_lines[0], ordered_lines[3]):
+            poses = poses_by_guide[line.line_id]
+            self.assertTrue(poses)
+            self.assertTrue(all(pose.profile_variant != "full" for pose in poses))
+            for pose in poses:
+                centroid_x = float(Polygon(scan_pose_profile_polygon(pose)).centroid.x)
+                self.assertLess(
+                    abs(centroid_x - mission.tank_center_m["x"]),
+                    abs(pose.anchor_x_m - mission.tank_center_m["x"]),
+                )
+        inner_left = poses_by_guide[ordered_lines[1].line_id]
+        inner_right = poses_by_guide[ordered_lines[2].line_id]
+        self.assertTrue(inner_left)
+        self.assertEqual(len(inner_left), len(inner_right))
+        self.assertTrue(all(pose.profile_variant == "full" for pose in inner_left + inner_right))
+        self.assertEqual(
+            [pose.anchor_y_m for pose in inner_left],
+            [pose.anchor_y_m for pose in inner_right],
+        )
+
     def test_geometry_limit_transitions_naturally_from_one_to_two_rows(self):
         self.assertEqual(determine_max_feasible_circular_rows(3.7), 1)
         self.assertEqual(determine_max_feasible_circular_rows(4.5), 2)
@@ -71,6 +132,27 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(mission.circular_rows), 1)
         self.assertEqual(mission.circular_stop_reason, "geometry_row_limit")
+
+    def test_every_circular_neighbor_has_exact_overlap_including_wraparound(self):
+        mission = build_outer_edge_sweep_mission(_model())
+
+        self.assertTrue(mission.circular_rows)
+        for row in mission.circular_rows:
+            poses = [pose for pose in mission.poses if pose.row_id == row.row_id]
+            polygons = [scan_pose_profile_polygon(pose) for pose in poses]
+            overlaps = [
+                _exact_circular_neighbor_overlap_fraction(
+                    polygons[index],
+                    polygons[(index + 1) % len(polygons)],
+                )
+                for index in range(len(polygons))
+            ]
+            self.assertTrue(
+                all(overlap >= MIN_CIRCULAR_OVERLAP_FRACTION for overlap in overlaps)
+            )
+            self.assertAlmostEqual(row.wraparound_overlap_fraction, overlaps[-1], places=10)
+            self.assertTrue(row.no_neighbor_gaps_verified)
+            self.assertTrue(row.wraparound_passed)
 
     def test_normal_mission_uses_only_approved_lawnmower_poses_after_circular_stage(self):
         model = _model()
@@ -131,6 +213,22 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
             max_profile_draw_count=24,
         )
         self.assertIsNotNone(figure)
+        labels = {line.get_label() for line in _axes.lines}
+        self.assertNotIn("Ordered mission path", labels)
+        self.assertNotIn("Vertical travel path", labels)
+        self.assertNotIn("Horizontal travel path", labels)
+        self.assertFalse(any(isinstance(collection, Quiver) for collection in _axes.collections))
+        self.assertFalse(
+            any(
+                isinstance(patch, Circle) and patch.get_linestyle() in {"--", ":"}
+                for patch in _axes.patches
+            )
+        )
+        profile_outlines = [
+            line for line in _axes.lines if line.get_label() == "_scan_profile_outline"
+        ]
+        self.assertTrue(profile_outlines)
+        self.assertTrue(all(line.get_linewidth() >= 1.25 for line in profile_outlines))
         figure.clf()
 
     def test_normal_mission_does_not_call_experimental_outer_guide_generation(self):
