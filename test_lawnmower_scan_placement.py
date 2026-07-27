@@ -6,6 +6,7 @@ import numpy as np
 
 from path_planner import (
     LAWN_SYMMETRY_POLYGON_ERROR_TOLERANCE,
+    MIN_NEW_COVERAGE_FRACTION,
     LawnmowerSectionLine,
     TankCircleEstimate,
     _generate_lawnmower_candidate_lattice,
@@ -159,7 +160,7 @@ class LawnmowerScanPlacementTests(unittest.TestCase):
         self.assertTrue(all(c.left_half_polygon.shape[1] == 2 for c in candidates))
         self.assertTrue(all(c.right_half_polygon.shape[1] == 2 for c in candidates))
 
-    def test_expected_immediate_neighbor_overlap_is_not_harmful(self):
+    def test_neighbor_overlap_is_diagnostic_not_an_acceptance_gate(self):
         line = _guide(10, "vertical", (0.0, -3.0), (0.0, 3.0))
         tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
 
@@ -167,21 +168,17 @@ class LawnmowerScanPlacementTests(unittest.TestCase):
         accepted = [
             candidate
             for candidate in gating.candidates
-            if candidate.acceptance_result == "accepted_full"
+            if candidate.acceptance_result == "accepted_full_new_coverage"
         ]
 
         self.assertGreaterEqual(len(accepted), 2)
-        self.assertGreater(
-            accepted[1].full_metrics.expected_neighbor_overlap_area_m2,
-            0.0,
-        )
-        self.assertAlmostEqual(
-            accepted[1].full_metrics.harmful_overlap_area_m2,
-            0.0,
-            places=8,
+        self.assertGreaterEqual(
+            accepted[1].full_metrics.new_area_m2
+            / accepted[1].full_metrics.total_area_m2,
+            MIN_NEW_COVERAGE_FRACTION,
         )
 
-    def test_nearly_redundant_duplicate_guide_is_rolled_back(self):
+    def test_duplicate_guide_candidates_are_rejected_without_guide_rollback(self):
         first = _guide(11, "vertical", (0.0, -3.0), (0.0, 3.0))
         second = _guide(12, "vertical", (0.0, -3.0), (0.0, 3.0))
         tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
@@ -194,6 +191,13 @@ class LawnmowerScanPlacementTests(unittest.TestCase):
             all(
                 placement.guide_line_id == first.line_id
                 for placement in gating.placements
+            )
+        )
+        self.assertTrue(
+            all(
+                candidate.acceptance_result == "rejected_duplicate"
+                for candidate in gating.candidates
+                if candidate.guide_line_id == second.line_id
             )
         )
 

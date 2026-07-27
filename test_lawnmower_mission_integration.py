@@ -48,7 +48,7 @@ def _model():
 
 
 class LawnmowerMissionIntegrationTests(unittest.TestCase):
-    def test_24ft_uses_one_stronger_circular_row_and_four_symmetric_vertical_columns(self):
+    def test_24ft_uses_one_stronger_circular_row_and_symmetric_vertical_columns(self):
         model = import_dxf(Path("3 Tank examples") / "24ft.dxf")
 
         mission = _build_mission_plan_once(model)
@@ -86,15 +86,8 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
         for line in (ordered_lines[0], ordered_lines[3]):
             poses = poses_by_guide[line.line_id]
             self.assertTrue(poses)
-            self.assertTrue(all(pose.profile_variant != "full" for pose in poses))
             for pose in poses:
-                centroid_x = float(Polygon(scan_pose_profile_polygon(pose)).centroid.x)
-                self.assertLess(
-                    abs(centroid_x - mission.tank_center_m["x"]),
-                    abs(pose.anchor_x_m - mission.tank_center_m["x"]),
-                )
-                self.assertAlmostEqual(pose.parent_full_x_m, pose.x_m, places=9)
-                self.assertAlmostEqual(pose.parent_full_y_m, pose.y_m, places=9)
+                self.assertIn(pose.profile_variant, {"full", "left_half", "right_half"})
         inner_left = poses_by_guide[ordered_lines[1].line_id]
         inner_right = poses_by_guide[ordered_lines[2].line_id]
         self.assertTrue(inner_left)
@@ -111,12 +104,11 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
             for line in ordered_lines
         ]
         self.assertTrue(ordered_anchor_lists[0])
-        self.assertTrue(
-            all(anchors == ordered_anchor_lists[0] for anchors in ordered_anchor_lists)
-        )
+        self.assertEqual(ordered_anchor_lists[0], ordered_anchor_lists[3])
+        self.assertEqual(ordered_anchor_lists[1], ordered_anchor_lists[2])
         self.assertEqual(
             [len(poses_by_guide[line.line_id]) for line in ordered_lines],
-            [6, 6, 6, 6],
+            [6, 8, 8, 6],
         )
         self.assertAlmostEqual(
             x_values[0] + x_values[3],

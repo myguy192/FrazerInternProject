@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -44,6 +45,7 @@ DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
 DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION = 0.02
 GEOMETRY_EPSILON = 1e-8
+MIN_NEW_COVERAGE_FRACTION = 0.40
 MAX_EXPECTED_NEIGHBOR_OVERLAP_FRACTION = 0.04
 MIN_FULL_INSIDE_FRACTION = 0.80
 MAX_FULL_OUTSIDE_FRACTION = 0.20
@@ -86,6 +88,7 @@ CIRCULAR_OVERLAP_TIE_FRACTION = 0.0025
 CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE = 48
 CIRCULAR_MAX_PROFILE_COUNT = 10000
 _TOUCHING_ANGULAR_STEP_CACHE: dict[tuple[float, float, float, float, int], float] = {}
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -2222,6 +2225,107 @@ def _select_salvaged_half(
     return None, "ambiguous_halves"
 
 
+def _new_coverage_fraction(metrics: LawnmowerCandidateMetrics) -> float:
+    """Return uncovered usable area as a fraction of the profile's own area."""
+    return metrics.new_area_m2 / max(metrics.total_area_m2, GEOMETRY_EPSILON)
+
+
+def _simple_profile_safety_reason(
+    candidate: LawnmowerCandidateRecord,
+    polygon: np.ndarray,
+    metrics: LawnmowerCandidateMetrics,
+    accepted_placements: list[LawnmowerScanPlacement],
+    *,
+    minimum_inside_fraction: float,
+    maximum_outside_fraction: float,
+) -> str | None:
+    """Keep the existing geometry, boundary, and duplicate safeguards only."""
+    geometry = as_polygon(polygon)
+    if (
+        not math.isfinite(candidate.heading_rad)
+        or not bool(np.all(np.isfinite(polygon)))
+        or geometry.is_empty
+        or not geometry.is_valid
+        or metrics.total_area_m2 <= GEOMETRY_EPSILON
+    ):
+        return "rejected_invalid_geometry"
+    if (
+        metrics.inside_area_m2 <= GEOMETRY_EPSILON
+        or metrics.inside_fraction < minimum_inside_fraction
+        or metrics.outside_fraction > maximum_outside_fraction
+    ):
+        return "rejected_boundary"
+    hypothetical = _placement_from_lawnmower_candidate(
+        candidate,
+        profile_variant="full",
+        placement_id=-1,
+    )
+    if _is_effectively_duplicate_lawnmower_placement(
+        hypothetical,
+        accepted_placements,
+    ):
+        return "rejected_duplicate"
+    return None
+
+
+def _select_simple_new_coverage_variant(
+    full_metrics: LawnmowerCandidateMetrics,
+    left_metrics: LawnmowerCandidateMetrics,
+    right_metrics: LawnmowerCandidateMetrics,
+    *,
+    full_safety_reason: str | None,
+    left_safety_reason: str | None,
+    right_safety_reason: str | None,
+) -> tuple[str | None, str]:
+    """Apply the one 40%-new-coverage full/half selection rule."""
+    if (
+        full_safety_reason is None
+        and _new_coverage_fraction(full_metrics) >= MIN_NEW_COVERAGE_FRACTION
+    ):
+        return "full", "accepted_full_new_coverage"
+
+    # Invalid or duplicate parent poses cannot be salvaged by selecting one of
+    # their halves. Boundary failures may be one-sided, so each half still gets
+    # its own existing boundary check below.
+    if full_safety_reason in {"rejected_invalid_geometry", "rejected_duplicate"}:
+        return None, full_safety_reason
+
+    passing_halves = [
+        ("left_half", left_metrics),
+        ("right_half", right_metrics),
+    ]
+    passing_halves = [
+        (variant, metrics)
+        for variant, metrics in passing_halves
+        if (
+            (left_safety_reason if variant == "left_half" else right_safety_reason)
+            is None
+            and _new_coverage_fraction(metrics) >= MIN_NEW_COVERAGE_FRACTION
+        )
+    ]
+    if len(passing_halves) == 1:
+        variant, _metrics = passing_halves[0]
+        return variant, f"accepted_{variant}_new_coverage"
+    if len(passing_halves) == 2:
+        left_metrics_passing = passing_halves[0][1]
+        right_metrics_passing = passing_halves[1][1]
+        # The left-half entry is deliberately first: it is the deterministic
+        # tie-break when the two areas are equal within geometry tolerance.
+        if (
+            right_metrics_passing.new_area_m2
+            > left_metrics_passing.new_area_m2 + GEOMETRY_EPSILON
+        ):
+            return "right_half", "accepted_right_half_new_coverage"
+        return "left_half", "accepted_left_half_new_coverage"
+
+    if full_safety_reason == "rejected_boundary" and (
+        left_safety_reason == "rejected_boundary"
+        or right_safety_reason == "rejected_boundary"
+    ):
+        return None, "rejected_boundary"
+    return None, "rejected_below_new_coverage_threshold"
+
+
 def _placement_from_lawnmower_candidate(
     candidate: LawnmowerCandidateRecord,
     *,
@@ -2331,22 +2435,58 @@ def gate_lawnmower_candidates(
                 local_coverage,
                 immediate_neighbor,
             )
-            reasons = _full_candidate_rejection_reasons(
+            full_safety_reason = _simple_profile_safety_reason(
                 candidate,
+                candidate.full_polygon,
                 full_metrics,
                 accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_FULL_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_FULL_OUTSIDE_FRACTION,
             )
-            selected_variant: str | None = None
-            result = "rejected_full"
-            if not reasons:
-                selected_variant = "full"
-                result = "accepted_full"
-            else:
-                selected_variant, result = _select_salvaged_half(
-                    reasons,
-                    left_metrics,
-                    right_metrics,
-                )
+            left_safety_reason = _simple_profile_safety_reason(
+                candidate,
+                candidate.left_half_polygon,
+                left_metrics,
+                accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_HALF_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_HALF_OUTSIDE_FRACTION,
+            )
+            right_safety_reason = _simple_profile_safety_reason(
+                candidate,
+                candidate.right_half_polygon,
+                right_metrics,
+                accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_HALF_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_HALF_OUTSIDE_FRACTION,
+            )
+            selected_variant, result = _select_simple_new_coverage_variant(
+                full_metrics,
+                left_metrics,
+                right_metrics,
+                full_safety_reason=full_safety_reason,
+                left_safety_reason=left_safety_reason,
+                right_safety_reason=right_safety_reason,
+            )
+            reasons = () if selected_variant is not None else (result,)
+            LOGGER.debug(
+                "lawnmower candidate stage=%s guide_id=%s anchor=%s "
+                "full_new_area=%.9g full_total_area=%.9g full_new_fraction=%.9g "
+                "left_new_area=%.9g left_new_fraction=%.9g "
+                "right_new_area=%.9g right_new_fraction=%.9g "
+                "selected_variant=%s result=%s",
+                candidate.candidate_stage,
+                candidate.guide_line_id,
+                candidate.anchor_m,
+                full_metrics.new_area_m2,
+                full_metrics.total_area_m2,
+                _new_coverage_fraction(full_metrics),
+                left_metrics.new_area_m2,
+                _new_coverage_fraction(left_metrics),
+                right_metrics.new_area_m2,
+                _new_coverage_fraction(right_metrics),
+                selected_variant,
+                result,
+            )
 
             evaluated = replace(
                 candidate,
@@ -2387,30 +2527,9 @@ def gate_lawnmower_candidates(
                 inside_area_m2=selected_metrics.inside_area_m2,
             )
 
-        guide_union = polygon_union(guide_polygons)
-        guide_incremental_area = float(guide_union.difference(coverage_before_guide).area)
-        guide_new_fraction = guide_incremental_area / max(
-            float(guide_union.area),
-            GEOMETRY_EPSILON,
-        )
-        retain_guide = (
-            bool(guide_placements)
-            and guide_incremental_area >= MIN_GUIDE_INCREMENTAL_AREA_M2
-            and guide_new_fraction >= MIN_GUIDE_NEW_FRACTION
-        )
-        if not retain_guide:
-            updated_candidates: list[LawnmowerCandidateRecord] = []
-            for evaluated in guide_candidates:
-                if evaluated.acceptance_result.startswith("accepted_"):
-                    evaluated = replace(
-                        evaluated,
-                        acceptance_result="guide_discarded",
-                        rejection_reasons=evaluated.rejection_reasons
-                        + ("guide_insufficient_incremental_coverage",),
-                    )
-                updated_candidates.append(evaluated)
-            guide_candidates = updated_candidates
-        return guide_placements, guide_polygons, guide_candidates, retain_guide
+        # The 40% candidate decision is the only coverage gate.  A guide with
+        # accepted candidates is retained; there is no second guide rollback.
+        return guide_placements, guide_polygons, guide_candidates, bool(guide_placements)
 
     for pair in symmetry_plan.pairs:
         coverage_before_pair = coverage
@@ -2460,13 +2579,7 @@ def gate_lawnmower_candidates(
         discarded_guide_ids=discarded_guide_ids,
         guide_pair_ids=guide_pair_ids,
     )
-    return _apply_symmetric_four_vertical_column_layout(
-        gating_pass,
-        lines,
-        tank,
-        edge_poses,
-        profile_config,
-    )
+    return gating_pass
 
 
 def _apply_symmetric_four_vertical_column_layout(
