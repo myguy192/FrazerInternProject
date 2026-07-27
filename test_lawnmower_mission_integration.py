@@ -93,14 +93,40 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
                     abs(centroid_x - mission.tank_center_m["x"]),
                     abs(pose.anchor_x_m - mission.tank_center_m["x"]),
                 )
+                self.assertAlmostEqual(pose.parent_full_x_m, pose.x_m, places=9)
+                self.assertAlmostEqual(pose.parent_full_y_m, pose.y_m, places=9)
         inner_left = poses_by_guide[ordered_lines[1].line_id]
         inner_right = poses_by_guide[ordered_lines[2].line_id]
         self.assertTrue(inner_left)
         self.assertEqual(len(inner_left), len(inner_right))
         self.assertTrue(all(pose.profile_variant == "full" for pose in inner_left + inner_right))
+        ordered_anchor_lists = [
+            [
+                pose.anchor_y_m
+                for pose in sorted(
+                    poses_by_guide[line.line_id],
+                    key=lambda pose: pose.anchor_y_m,
+                )
+            ]
+            for line in ordered_lines
+        ]
+        self.assertTrue(ordered_anchor_lists[0])
+        self.assertTrue(
+            all(anchors == ordered_anchor_lists[0] for anchors in ordered_anchor_lists)
+        )
         self.assertEqual(
-            [pose.anchor_y_m for pose in inner_left],
-            [pose.anchor_y_m for pose in inner_right],
+            [len(poses_by_guide[line.line_id]) for line in ordered_lines],
+            [6, 6, 6, 6],
+        )
+        self.assertAlmostEqual(
+            x_values[0] + x_values[3],
+            2.0 * mission.tank_center_m["x"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            x_values[1] + x_values[2],
+            2.0 * mission.tank_center_m["x"],
+            places=9,
         )
 
     def test_geometry_limit_transitions_naturally_from_one_to_two_rows(self):

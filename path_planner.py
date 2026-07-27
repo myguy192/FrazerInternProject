@@ -72,6 +72,8 @@ HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION = 0.15
 HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M = 0.08
 PERPENDICULAR_SECTION_CLEARANCE_M = 0.02
 SECTION_BOUNDARY_MATCH_TOLERANCE_M = 0.03
+LAWN_SYMMETRY_POSITION_TOLERANCE_M = SECTION_BOUNDARY_MATCH_TOLERANCE_M
+LAWN_SYMMETRY_POLYGON_ERROR_TOLERANCE = 5e-4
 SECTION_MIN_LENGTH_M = 1e-6
 INTERIOR_POSE_POSITION_TOLERANCE_M = 0.01
 INTERIOR_POSE_ANGLE_TOLERANCE_RAD = math.radians(1.0)
@@ -207,6 +209,7 @@ class LawnmowerCandidateRecord:
     right_half_polygon: np.ndarray
     candidate_source: str
     candidate_stage: str
+    symmetry_pair_id: str | None = None
     acceptance_result: str = "pending"
     rejection_reasons: tuple[str, ...] = ()
     full_metrics: LawnmowerCandidateMetrics | None = None
@@ -230,6 +233,43 @@ class LawnmowerGatingPass:
     candidates: list[LawnmowerCandidateRecord]
     retained_guide_ids: list[int]
     discarded_guide_ids: list[int]
+    guide_pair_ids: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LawnmowerGuidePair:
+    """One stable mirror pair, or one axis/single guide when ``right_line_id`` is absent."""
+
+    pair_id: str
+    orientation: str
+    left_line_id: int
+    right_line_id: int | None
+    cross_mirror_error_m: float
+    longitudinal_interval_m: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class LawnmowerSymmetryPlan:
+    """Geometry-only mirror pairing used by candidate generation and gating."""
+
+    pairs: tuple[LawnmowerGuidePair, ...]
+    symmetric_orientations: tuple[str, ...]
+    duplicate_line_ids: tuple[int, ...]
+    common_four_vertical_interval_m: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class LawnmowerSymmetryMetrics:
+    """Reusable mirror errors for one accepted guide pair."""
+
+    pair_id: str
+    orientation: str
+    first_line_id: int
+    second_line_id: int
+    cross_mirror_error_m: float
+    scan_count_difference: int
+    maximum_anchor_error_m: float
+    maximum_polygon_error_fraction: float
 
 
 @dataclass(frozen=True)
@@ -1633,9 +1673,228 @@ def _generate_lawnmower_placement_pass(
     return LawnmowerPlacementPass(accepted=placements, rejected=rejected)
 
 
+def _lawnmower_line_cross_coordinate(line: LawnmowerSectionLine) -> float:
+    return float(line.start_m[0] if line.orientation == "vertical" else line.start_m[1])
+
+
+def _lawnmower_line_progress_interval(
+    line: LawnmowerSectionLine,
+) -> tuple[float, float]:
+    coordinates = (
+        (line.start_m[1], line.end_m[1])
+        if line.orientation == "vertical"
+        else (line.start_m[0], line.end_m[0])
+    )
+    return float(min(coordinates)), float(max(coordinates))
+
+
+def detect_lawnmower_guide_symmetry(
+    lines: list[LawnmowerSectionLine],
+    tank: TankCircleEstimate,
+    *,
+    tolerance_m: float = LAWN_SYMMETRY_POSITION_TOLERANCE_M,
+) -> LawnmowerSymmetryPlan:
+    """Pair guide geometry only when its reflection about the tank center exists."""
+    pairs: list[LawnmowerGuidePair] = []
+    symmetric_orientations: list[str] = []
+    duplicate_line_ids: list[int] = []
+    unique_by_orientation: dict[str, list[LawnmowerSectionLine]] = {}
+
+    for orientation in ("vertical", "horizontal"):
+        orientation_lines = sorted(
+            (line for line in lines if line.orientation == orientation),
+            key=lambda line: (
+                _lawnmower_line_cross_coordinate(line),
+                *_lawnmower_line_progress_interval(line),
+                line.line_id,
+            ),
+        )
+        unique_lines: list[LawnmowerSectionLine] = []
+        for line in orientation_lines:
+            cross_m = _lawnmower_line_cross_coordinate(line)
+            progress_min, progress_max = _lawnmower_line_progress_interval(line)
+            duplicate = next(
+                (
+                    existing
+                    for existing in unique_lines
+                    if abs(_lawnmower_line_cross_coordinate(existing) - cross_m) <= tolerance_m
+                    and abs(_lawnmower_line_progress_interval(existing)[0] - progress_min) <= tolerance_m
+                    and abs(_lawnmower_line_progress_interval(existing)[1] - progress_max) <= tolerance_m
+                ),
+                None,
+            )
+            if duplicate is not None:
+                duplicate_line_ids.append(line.line_id)
+            else:
+                unique_lines.append(line)
+        unique_by_orientation[orientation] = unique_lines
+
+        if not unique_lines:
+            symmetric_orientations.append(orientation)
+            continue
+
+        center_cross = tank.center_x if orientation == "vertical" else tank.center_y
+        remaining = {line.line_id: line for line in unique_lines}
+        provisional: list[tuple[LawnmowerSectionLine, LawnmowerSectionLine | None, float]] = []
+        symmetric = True
+        for line in unique_lines:
+            if line.line_id not in remaining:
+                continue
+            cross_m = _lawnmower_line_cross_coordinate(line)
+            progress_min, progress_max = _lawnmower_line_progress_interval(line)
+            if abs(cross_m - center_cross) <= tolerance_m:
+                provisional.append((line, None, abs(cross_m - center_cross)))
+                del remaining[line.line_id]
+                continue
+            target_cross = 2.0 * center_cross - cross_m
+            candidates: list[tuple[float, LawnmowerSectionLine]] = []
+            for other in remaining.values():
+                if other.line_id == line.line_id:
+                    continue
+                other_min, other_max = _lawnmower_line_progress_interval(other)
+                cross_error = abs(_lawnmower_line_cross_coordinate(other) - target_cross)
+                interval_error = max(
+                    abs(other_min - progress_min),
+                    abs(other_max - progress_max),
+                )
+                if cross_error <= tolerance_m and interval_error <= tolerance_m:
+                    candidates.append((cross_error + interval_error, other))
+            if not candidates:
+                symmetric = False
+                break
+            _error, other = min(candidates, key=lambda item: (item[0], item[1].line_id))
+            first, second = sorted(
+                (line, other),
+                key=lambda item: (
+                    _lawnmower_line_cross_coordinate(item),
+                    item.line_id,
+                ),
+            )
+            mirror_error = abs(
+                _lawnmower_line_cross_coordinate(first)
+                + _lawnmower_line_cross_coordinate(second)
+                - 2.0 * center_cross
+            )
+            provisional.append((first, second, mirror_error))
+            del remaining[line.line_id]
+            del remaining[other.line_id]
+
+        if symmetric and not remaining:
+            symmetric_orientations.append(orientation)
+            provisional.sort(
+                key=lambda item: (
+                    _lawnmower_line_cross_coordinate(item[0]),
+                    _lawnmower_line_progress_interval(item[0]),
+                )
+            )
+            for pair_index, (first, second, mirror_error) in enumerate(provisional):
+                intervals = [_lawnmower_line_progress_interval(first)]
+                if second is not None:
+                    intervals.append(_lawnmower_line_progress_interval(second))
+                shared_interval = (
+                    max(interval[0] for interval in intervals),
+                    min(interval[1] for interval in intervals),
+                )
+                pairs.append(
+                    LawnmowerGuidePair(
+                        pair_id=f"{orientation}_pair_{pair_index}",
+                        orientation=orientation,
+                        left_line_id=first.line_id,
+                        right_line_id=None if second is None else second.line_id,
+                        cross_mirror_error_m=mirror_error,
+                        longitudinal_interval_m=shared_interval,
+                    )
+                )
+        else:
+            for line in orientation_lines:
+                interval = _lawnmower_line_progress_interval(line)
+                pairs.append(
+                    LawnmowerGuidePair(
+                        pair_id=f"{orientation}_single_{line.line_id}",
+                        orientation=orientation,
+                        left_line_id=line.line_id,
+                        right_line_id=None,
+                        cross_mirror_error_m=math.inf,
+                        longitudinal_interval_m=interval,
+                    )
+                )
+
+    # The real four-column/no-row geometry uses one longitudinal lattice for
+    # all four guides. This is detected from the guide geometry itself.
+    common_four_interval: tuple[float, float] | None = None
+    vertical_unique = unique_by_orientation.get("vertical", [])
+    horizontal_unique = unique_by_orientation.get("horizontal", [])
+    if (
+        len(vertical_unique) == 4
+        and not horizontal_unique
+        and "vertical" in symmetric_orientations
+        and not any(line.is_outer_extension for line in vertical_unique)
+    ):
+        cross_values = np.asarray(
+            sorted(_lawnmower_line_cross_coordinate(line) for line in vertical_unique),
+            dtype=float,
+        )
+        spacings = np.diff(cross_values)
+        if len(spacings) == 3 and bool(
+            np.all(
+                np.abs(spacings - float(np.median(spacings)))
+                <= tolerance_m
+            )
+        ):
+            intervals = [
+                _lawnmower_line_progress_interval(line)
+                for line in vertical_unique
+            ]
+            candidate_interval = (
+                max(interval[0] for interval in intervals),
+                min(interval[1] for interval in intervals),
+            )
+            if candidate_interval[1] - candidate_interval[0] > SECTION_MIN_LENGTH_M:
+                common_four_interval = candidate_interval
+
+    # Duplicate guides are intentionally excluded from mirror pairing. They
+    # remain independent so the normal guide rollback rejects their redundancy.
+    paired_ids = {
+        line_id
+        for pair in pairs
+        for line_id in (pair.left_line_id, pair.right_line_id)
+        if line_id is not None
+    }
+    lines_by_id = {line.line_id: line for line in lines}
+    for line_id in sorted(set(duplicate_line_ids) - paired_ids):
+        line = lines_by_id[line_id]
+        pairs.append(
+            LawnmowerGuidePair(
+                pair_id=f"{line.orientation}_duplicate_{line_id}",
+                orientation=line.orientation,
+                left_line_id=line_id,
+                right_line_id=None,
+                cross_mirror_error_m=math.inf,
+                longitudinal_interval_m=_lawnmower_line_progress_interval(line),
+            )
+        )
+
+    pairs.sort(
+        key=lambda pair: (
+            0 if pair.orientation == "vertical" else 1,
+            _lawnmower_line_cross_coordinate(lines_by_id[pair.left_line_id]),
+            _lawnmower_line_progress_interval(lines_by_id[pair.left_line_id]),
+            1 if "_duplicate_" in pair.pair_id else 0,
+            pair.pair_id,
+        )
+    )
+    return LawnmowerSymmetryPlan(
+        pairs=tuple(pairs),
+        symmetric_orientations=tuple(symmetric_orientations),
+        duplicate_line_ids=tuple(sorted(set(duplicate_line_ids))),
+        common_four_vertical_interval_m=common_four_interval,
+    )
+
+
 def _generate_lawnmower_candidate_lattice(
     lines: list[LawnmowerSectionLine],
     *,
+    tank: TankCircleEstimate | None = None,
     profile_config: RainbowProfileConfig | None = None,
     target_overlap_fraction: float = DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
 ) -> list[LawnmowerCandidateRecord]:
@@ -1656,6 +1915,41 @@ def _generate_lawnmower_candidate_lattice(
             line.line_id,
         ),
     )
+    symmetry_plan = (
+        detect_lawnmower_guide_symmetry(lines, tank)
+        if tank is not None
+        else None
+    )
+    pair_by_line: dict[int, LawnmowerGuidePair] = {}
+    shared_progress_by_line: dict[int, np.ndarray] = {}
+    if symmetry_plan is not None:
+        for pair in symmetry_plan.pairs:
+            interval = pair.longitudinal_interval_m
+            if (
+                pair.orientation == "vertical"
+                and symmetry_plan.common_four_vertical_interval_m is not None
+            ):
+                interval = symmetry_plan.common_four_vertical_interval_m
+            interval_length = interval[1] - interval[0]
+            if interval_length <= SECTION_MIN_LENGTH_M:
+                continue
+            distances = _lawnmower_anchor_distances(
+                interval_length,
+                local_profile,
+                local_anchor,
+                target_step,
+            )
+            progress_values = interval[0] + distances
+            for line_id in (pair.left_line_id, pair.right_line_id):
+                if line_id is None:
+                    continue
+                pair_by_line[line_id] = pair
+                if pair.right_line_id is not None or (
+                    pair.orientation == "vertical"
+                    and symmetry_plan.common_four_vertical_interval_m is not None
+                ):
+                    shared_progress_by_line[line_id] = progress_values
+
     records: list[LawnmowerCandidateRecord] = []
     for line in ordered_lines:
         start = np.asarray(line.start_m, dtype=float)
@@ -1667,16 +1961,34 @@ def _generate_lawnmower_candidate_lattice(
         direction = delta / length
         heading_rad = _normalize_angle(math.atan2(direction[1], direction[0]) - math.pi / 2.0)
         canonical_start, canonical_direction = _canonical_lawnmower_line_reference(start, end)
-        anchor_distances = _lawnmower_anchor_distances(
-            length,
-            local_profile,
-            local_anchor,
-            target_step,
-        )
-        anchor_points = [
-            canonical_start + canonical_direction * distance_m
-            for distance_m in anchor_distances
-        ]
+        shared_progress = shared_progress_by_line.get(line.line_id)
+        if shared_progress is None:
+            anchor_distances = _lawnmower_anchor_distances(
+                length,
+                local_profile,
+                local_anchor,
+                target_step,
+            )
+            anchor_points = [
+                canonical_start + canonical_direction * distance_m
+                for distance_m in anchor_distances
+            ]
+        elif line.orientation == "vertical":
+            anchor_points = [
+                np.asarray(
+                    (_lawnmower_line_cross_coordinate(line), progress_m),
+                    dtype=float,
+                )
+                for progress_m in shared_progress
+            ]
+        else:
+            anchor_points = [
+                np.asarray(
+                    (progress_m, _lawnmower_line_cross_coordinate(line)),
+                    dtype=float,
+                )
+                for progress_m in shared_progress
+            ]
         if float(np.dot(direction, canonical_direction)) < 0.0:
             anchor_points.reverse()
         travel_direction = _line_travel_direction(direction)
@@ -1722,6 +2034,11 @@ def _generate_lawnmower_candidate_lattice(
                         "interior_vertical"
                         if line.orientation == "vertical"
                         else "interior_horizontal"
+                    ),
+                    symmetry_pair_id=(
+                        pair_by_line[line.line_id].pair_id
+                        if line.line_id in pair_by_line
+                        else None
                     ),
                 )
             )
@@ -1947,6 +2264,7 @@ def gate_lawnmower_candidates(
     )
     candidates = _generate_lawnmower_candidate_lattice(
         lines,
+        tank=tank,
         profile_config=profile_config,
     )
     candidates_by_guide: dict[int, list[LawnmowerCandidateRecord]] = {}
@@ -1962,19 +2280,28 @@ def gate_lawnmower_candidates(
     evaluated_candidates: list[LawnmowerCandidateRecord] = []
     retained_guide_ids: list[int] = []
     discarded_guide_ids: list[int] = []
-    ordered_lines = sorted(
-        lines,
-        key=lambda line: (
-            0 if line.orientation == "vertical" else 1,
-            line.order_index,
-            line.line_id,
-        ),
-    )
-    for line in ordered_lines:
-        coverage_before_guide = coverage
+    symmetry_plan = detect_lawnmower_guide_symmetry(lines, tank)
+    lines_by_id = {line.line_id: line for line in lines}
+    guide_pair_ids = {
+        line_id: pair.pair_id
+        for pair in symmetry_plan.pairs
+        for line_id in (pair.left_line_id, pair.right_line_id)
+        if line_id is not None
+    }
+
+    def evaluate_guide(
+        line: LawnmowerSectionLine,
+        coverage_before_guide: BaseGeometry,
+    ) -> tuple[
+        list[LawnmowerScanPlacement],
+        list[np.ndarray],
+        list[LawnmowerCandidateRecord],
+        bool,
+    ]:
+        local_coverage = coverage_before_guide
         guide_placements: list[LawnmowerScanPlacement] = []
         guide_polygons: list[np.ndarray] = []
-        guide_candidate_indices: list[int] = []
+        guide_candidates: list[LawnmowerCandidateRecord] = []
         immediate_neighbor: AcceptedLawnmowerCoverage | None = None
         valid_region = build_candidate_valid_region(
             line.start_m,
@@ -1989,19 +2316,19 @@ def gate_lawnmower_candidates(
             full_metrics = _exact_lawnmower_candidate_metrics(
                 candidate.full_polygon,
                 valid_region,
-                coverage,
+                local_coverage,
                 immediate_neighbor,
             )
             left_metrics = _exact_lawnmower_candidate_metrics(
                 candidate.left_half_polygon,
                 valid_region,
-                coverage,
+                local_coverage,
                 immediate_neighbor,
             )
             right_metrics = _exact_lawnmower_candidate_metrics(
                 candidate.right_half_polygon,
                 valid_region,
-                coverage,
+                local_coverage,
                 immediate_neighbor,
             )
             reasons = _full_candidate_rejection_reasons(
@@ -2029,8 +2356,7 @@ def gate_lawnmower_candidates(
                 left_half_metrics=left_metrics,
                 right_half_metrics=right_metrics,
             )
-            evaluated_candidates.append(evaluated)
-            guide_candidate_indices.append(len(evaluated_candidates) - 1)
+            guide_candidates.append(evaluated)
             if selected_variant is None:
                 continue
 
@@ -2051,7 +2377,7 @@ def gate_lawnmower_candidates(
             }[selected_variant]
             guide_placements.append(placement)
             guide_polygons.append(selected_polygon)
-            coverage = coverage.union(as_polygon(selected_polygon))
+            local_coverage = local_coverage.union(as_polygon(selected_polygon))
             immediate_neighbor = AcceptedLawnmowerCoverage(
                 guide_line_id=line.line_id,
                 orientation=line.orientation,
@@ -2072,31 +2398,67 @@ def gate_lawnmower_candidates(
             and guide_incremental_area >= MIN_GUIDE_INCREMENTAL_AREA_M2
             and guide_new_fraction >= MIN_GUIDE_NEW_FRACTION
         )
-        if retain_guide:
-            retained_guide_ids.append(line.line_id)
-            accepted_placements.extend(guide_placements)
-        else:
-            discarded_guide_ids.append(line.line_id)
-            coverage = coverage_before_guide
-            for candidate_index in guide_candidate_indices:
-                evaluated = evaluated_candidates[candidate_index]
+        if not retain_guide:
+            updated_candidates: list[LawnmowerCandidateRecord] = []
+            for evaluated in guide_candidates:
                 if evaluated.acceptance_result.startswith("accepted_"):
-                    evaluated_candidates[candidate_index] = replace(
+                    evaluated = replace(
                         evaluated,
                         acceptance_result="guide_discarded",
                         rejection_reasons=evaluated.rejection_reasons
                         + ("guide_insufficient_incremental_coverage",),
                     )
+                updated_candidates.append(evaluated)
+            guide_candidates = updated_candidates
+        return guide_placements, guide_polygons, guide_candidates, retain_guide
+
+    for pair in symmetry_plan.pairs:
+        coverage_before_pair = coverage
+        pair_accepted: list[LawnmowerScanPlacement] = []
+        pair_polygons: list[np.ndarray] = []
+        pair_candidates: list[LawnmowerCandidateRecord] = []
+        for line_id in (pair.left_line_id, pair.right_line_id):
+            if line_id is None:
+                continue
+            line = lines_by_id[line_id]
+            (
+                guide_placements,
+                guide_polygons,
+                guide_candidates,
+                retain_guide,
+            ) = evaluate_guide(line, coverage_before_pair)
+            pair_candidates.extend(guide_candidates)
+            if retain_guide:
+                retained_guide_ids.append(line.line_id)
+                pair_accepted.extend(guide_placements)
+                pair_polygons.extend(guide_polygons)
+            else:
+                discarded_guide_ids.append(line.line_id)
+        evaluated_candidates.extend(pair_candidates)
+        accepted_placements.extend(pair_accepted)
+        if pair_polygons:
+            coverage = coverage_before_pair.union(polygon_union(pair_polygons))
 
     accepted_placements = [
         replace(placement, placement_id=index)
-        for index, placement in enumerate(accepted_placements)
+        for index, placement in enumerate(
+            sorted(
+                accepted_placements,
+                key=lambda placement: (
+                    0 if placement.orientation == "vertical" else 1,
+                    placement.guide_order_index,
+                    placement.placement_index,
+                ),
+            )
+        )
     ]
+    evaluated_candidates.sort(key=lambda candidate: candidate.candidate_id)
     gating_pass = LawnmowerGatingPass(
         placements=accepted_placements,
         candidates=evaluated_candidates,
         retained_guide_ids=retained_guide_ids,
         discarded_guide_ids=discarded_guide_ids,
+        guide_pair_ids=guide_pair_ids,
     )
     return _apply_symmetric_four_vertical_column_layout(
         gating_pass,
@@ -2203,13 +2565,16 @@ def _apply_symmetric_four_vertical_column_layout(
     shared_outer_keys = sorted(set(outer_maps[0]) & set(outer_maps[1]))
     if not shared_outer_keys:
         return gating_pass
+    shared_all_keys = sorted(set(shared_inner_keys) & set(shared_outer_keys))
+    if not shared_all_keys:
+        return gating_pass
 
     selected: dict[int, str] = {}
     for candidate_map in inner_maps:
-        for key in shared_inner_keys:
+        for key in shared_all_keys:
             selected[candidate_map[key].candidate_id] = "full"
     for candidate_map, variant in zip(outer_maps, outer_variants):
-        for key in shared_outer_keys:
+        for key in shared_all_keys:
             selected[candidate_map[key].candidate_id] = variant
 
     selected_candidates = [
@@ -2225,7 +2590,7 @@ def _apply_symmetric_four_vertical_column_layout(
         polygon
         for polygon, _bounds in _circular_edge_polygon_records(local_profile, edge_poses)
     ]
-    coverage = polygon_union(circular_polygons)
+    coverage_snapshot = polygon_union(circular_polygons)
     for line in vertical:
         guide_polygons = [
             {
@@ -2237,14 +2602,13 @@ def _apply_symmetric_four_vertical_column_layout(
             if candidate.guide_line_id == line.line_id
         ]
         guide_union = polygon_union(guide_polygons)
-        incremental_area = float(guide_union.difference(coverage).area)
+        incremental_area = float(guide_union.difference(coverage_snapshot).area)
         incremental_fraction = incremental_area / max(float(guide_union.area), GEOMETRY_EPSILON)
         if (
             incremental_area < MIN_GUIDE_INCREMENTAL_AREA_M2
             or incremental_fraction < MIN_GUIDE_NEW_FRACTION
         ):
             return gating_pass
-        coverage = coverage.union(guide_union)
 
     placements = [
         _placement_from_lawnmower_candidate(
@@ -2284,6 +2648,7 @@ def _apply_symmetric_four_vertical_column_layout(
         candidates=updated_candidates,
         retained_guide_ids=[line.line_id for line in vertical],
         discarded_guide_ids=[],
+        guide_pair_ids=gating_pass.guide_pair_ids,
     )
 
 
@@ -2477,6 +2842,122 @@ def lawnmower_scan_profile_polygon(
         placement.profile_origin_m[1],
         placement.heading_rad,
     )
+
+
+def _reflect_lawnmower_polygon(
+    polygon: np.ndarray,
+    orientation: str,
+    tank: TankCircleEstimate,
+) -> np.ndarray:
+    reflected = np.asarray(polygon, dtype=float).copy()
+    if orientation == "vertical":
+        reflected[:, 0] = 2.0 * tank.center_x - reflected[:, 0]
+    else:
+        reflected[:, 1] = 2.0 * tank.center_y - reflected[:, 1]
+    return reflected
+
+
+def measure_lawnmower_symmetry(
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    tank: TankCircleEstimate,
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> list[LawnmowerSymmetryMetrics]:
+    """Return anchor, guide, and reflected-polygon errors for mirrored pairs."""
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    plan = detect_lawnmower_guide_symmetry(lines, tank)
+    metrics: list[LawnmowerSymmetryMetrics] = []
+    for pair in plan.pairs:
+        if pair.right_line_id is None:
+            continue
+        first = sorted(
+            (
+                placement
+                for placement in placements
+                if placement.guide_line_id == pair.left_line_id
+            ),
+            key=lambda placement: (
+                placement.anchor_m[1]
+                if pair.orientation == "vertical"
+                else placement.anchor_m[0]
+            ),
+        )
+        second = sorted(
+            (
+                placement
+                for placement in placements
+                if placement.guide_line_id == pair.right_line_id
+            ),
+            key=lambda placement: (
+                placement.anchor_m[1]
+                if pair.orientation == "vertical"
+                else placement.anchor_m[0]
+            ),
+        )
+        first_anchors = [
+            placement.anchor_m[1]
+            if pair.orientation == "vertical"
+            else placement.anchor_m[0]
+            for placement in first
+        ]
+        second_anchors = [
+            placement.anchor_m[1]
+            if pair.orientation == "vertical"
+            else placement.anchor_m[0]
+            for placement in second
+        ]
+        if len(first_anchors) != len(second_anchors):
+            maximum_anchor_error = math.inf
+            maximum_polygon_error = math.inf
+        else:
+            maximum_anchor_error = max(
+                (
+                    abs(first_anchor - second_anchor)
+                    for first_anchor, second_anchor in zip(
+                        first_anchors,
+                        second_anchors,
+                    )
+                ),
+                default=0.0,
+            )
+            polygon_errors: list[float] = []
+            for first_placement, second_placement in zip(first, second):
+                first_polygon = lawnmower_scan_profile_polygon(
+                    first_placement,
+                    profile_config,
+                )
+                reflected = as_polygon(
+                    _reflect_lawnmower_polygon(
+                        first_polygon,
+                        pair.orientation,
+                        tank,
+                    )
+                )
+                second_polygon = as_polygon(
+                    lawnmower_scan_profile_polygon(
+                        second_placement,
+                        profile_config,
+                    )
+                )
+                polygon_errors.append(
+                    float(reflected.symmetric_difference(second_polygon).area)
+                    / max(float(second_polygon.area), GEOMETRY_EPSILON)
+                )
+            maximum_polygon_error = max(polygon_errors, default=0.0)
+        metrics.append(
+            LawnmowerSymmetryMetrics(
+                pair_id=pair.pair_id,
+                orientation=pair.orientation,
+                first_line_id=pair.left_line_id,
+                second_line_id=pair.right_line_id,
+                cross_mirror_error_m=pair.cross_mirror_error_m,
+                scan_count_difference=abs(len(first) - len(second)),
+                maximum_anchor_error_m=maximum_anchor_error,
+                maximum_polygon_error_fraction=maximum_polygon_error,
+            )
+        )
+    return metrics
 
 
 def scan_pose_profile_polygon(
@@ -3979,21 +4460,31 @@ def _polygons_overlap_or_touch(first: np.ndarray, second: np.ndarray, tolerance:
     first_polygon = _without_duplicate_closure(first)
     second_polygon = _without_duplicate_closure(second)
 
-    for first_index in range(len(first_polygon)):
-        first_start = first_polygon[first_index]
-        first_end = first_polygon[(first_index + 1) % len(first_polygon)]
-        for second_index in range(len(second_polygon)):
-            second_start = second_polygon[second_index]
-            second_end = second_polygon[(second_index + 1) % len(second_polygon)]
-            if (
-                max(first_start[0], first_end[0]) < min(second_start[0], second_end[0]) - tolerance
-                or min(first_start[0], first_end[0]) > max(second_start[0], second_end[0]) + tolerance
-                or max(first_start[1], first_end[1]) < min(second_start[1], second_end[1]) - tolerance
-                or min(first_start[1], first_end[1]) > max(second_start[1], second_end[1]) + tolerance
-            ):
-                continue
-            if _segments_intersect(first_start, first_end, second_start, second_end, tolerance):
-                return True
+    first_starts = first_polygon
+    first_ends = np.roll(first_polygon, -1, axis=0)
+    second_starts = second_polygon
+    second_ends = np.roll(second_polygon, -1, axis=0)
+
+    first_min = np.minimum(first_starts, first_ends)
+    first_max = np.maximum(first_starts, first_ends)
+    second_min = np.minimum(second_starts, second_ends)
+    second_max = np.maximum(second_starts, second_ends)
+    bounds_overlap = (
+        (first_max[:, None, 0] >= second_min[None, :, 0] - tolerance)
+        & (first_min[:, None, 0] <= second_max[None, :, 0] + tolerance)
+        & (first_max[:, None, 1] >= second_min[None, :, 1] - tolerance)
+        & (first_min[:, None, 1] <= second_max[None, :, 1] + tolerance)
+    )
+    first_indices, second_indices = np.nonzero(bounds_overlap)
+    for first_index, second_index in zip(first_indices, second_indices):
+        if _segments_intersect(
+            first_starts[first_index],
+            first_ends[first_index],
+            second_starts[second_index],
+            second_ends[second_index],
+            tolerance,
+        ):
+            return True
 
     return _point_in_polygon(first_polygon[0], second_polygon) or _point_in_polygon(second_polygon[0], first_polygon)
 

@@ -5,14 +5,17 @@ from unittest.mock import patch
 import numpy as np
 
 from path_planner import (
+    LAWN_SYMMETRY_POLYGON_ERROR_TOLERANCE,
     LawnmowerSectionLine,
     TankCircleEstimate,
     _generate_lawnmower_candidate_lattice,
+    detect_lawnmower_guide_symmetry,
     estimate_lawnmower_neighbor_overlap_fraction,
     gate_lawnmower_candidates,
     generate_lawnmower_scan_placements,
     lawnmower_long_side_endpoints,
     lawnmower_scan_profile_polygon,
+    measure_lawnmower_symmetry,
 )
 
 
@@ -192,6 +195,94 @@ class LawnmowerScanPlacementTests(unittest.TestCase):
                 placement.guide_line_id == first.line_id
                 for placement in gating.placements
             )
+        )
+
+    def test_symmetric_guides_are_paired_but_asymmetric_guides_are_not_forced(self):
+        tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
+        symmetric = [
+            _guide(20, "vertical", (-1.0, -3.0), (-1.0, 3.0)),
+            _guide(21, "vertical", (1.0, -3.0), (1.0, 3.0)),
+        ]
+        plan = detect_lawnmower_guide_symmetry(symmetric, tank)
+
+        self.assertIn("vertical", plan.symmetric_orientations)
+        self.assertEqual(
+            [(pair.left_line_id, pair.right_line_id) for pair in plan.pairs],
+            [(20, 21)],
+        )
+
+        asymmetric = [
+            symmetric[0],
+            _guide(21, "vertical", (1.0, -2.0), (1.0, 3.0)),
+        ]
+        plan = detect_lawnmower_guide_symmetry(asymmetric, tank)
+
+        self.assertNotIn("vertical", plan.symmetric_orientations)
+        self.assertTrue(all(pair.right_line_id is None for pair in plan.pairs))
+
+    def test_mirrored_guides_share_lattice_snapshot_and_are_order_independent(self):
+        tank = TankCircleEstimate(0.0, 0.0, 10.0, "test")
+        lines = [
+            _guide(30, "vertical", (-1.0, -3.0), (-1.0, 3.0)),
+            _guide(31, "vertical", (1.0, -3.0), (1.0, 3.0)),
+        ]
+
+        forward = gate_lawnmower_candidates(lines, tank, [])
+        reverse = gate_lawnmower_candidates(list(reversed(lines)), tank, [])
+        forward_signature = [
+            (
+                placement.guide_line_id,
+                placement.profile_variant,
+                placement.anchor_m,
+            )
+            for placement in forward.placements
+        ]
+        reverse_signature = [
+            (
+                placement.guide_line_id,
+                placement.profile_variant,
+                placement.anchor_m,
+            )
+            for placement in reverse.placements
+        ]
+        self.assertEqual(forward_signature, reverse_signature)
+
+        candidates_by_guide = {
+            line.line_id: sorted(
+                (
+                    candidate
+                    for candidate in forward.candidates
+                    if candidate.guide_line_id == line.line_id
+                ),
+                key=lambda candidate: candidate.anchor_m[1],
+            )
+            for line in lines
+        }
+        left = candidates_by_guide[30]
+        right = candidates_by_guide[31]
+        self.assertEqual(
+            [candidate.anchor_m[1] for candidate in left],
+            [candidate.anchor_m[1] for candidate in right],
+        )
+        for left_candidate, right_candidate in zip(left, right):
+            self.assertAlmostEqual(
+                left_candidate.full_metrics.total_overlap_area_m2,
+                right_candidate.full_metrics.total_overlap_area_m2,
+                places=8,
+            )
+            self.assertAlmostEqual(
+                left_candidate.full_metrics.new_area_m2,
+                right_candidate.full_metrics.new_area_m2,
+                places=8,
+            )
+
+        symmetry = measure_lawnmower_symmetry(lines, forward.placements, tank)
+        self.assertEqual(len(symmetry), 1)
+        self.assertEqual(symmetry[0].scan_count_difference, 0)
+        self.assertLessEqual(symmetry[0].maximum_anchor_error_m, 1e-9)
+        self.assertLessEqual(
+            symmetry[0].maximum_polygon_error_fraction,
+            LAWN_SYMMETRY_POLYGON_ERROR_TOLERANCE,
         )
 
 
