@@ -13,7 +13,13 @@ import numpy as np
 from dxf_importer import DxfImportError, GeometryModel, import_dxf
 from observation_region import ScanFootprintRegion, clip_segment_to_observed_region
 from scan_profile import RainbowProfileConfig
-from tank_layout_predictor import LayoutPoint, ObservedSegment, ObservedTankGeometry, TankGeometry
+from grid_predictor import (
+    LayoutPoint,
+    ObservedSegment,
+    ObservedTankGeometry,
+    TankGeometry,
+    predict_tank_layout,
+)
 
 
 DEFAULT_MINIMUM_FAMILY_SCORE = 0.58
@@ -95,6 +101,8 @@ class PredictionResult:
     observed_segments: list[ObservedSegment]
     predicted_segments: list[PredictedSegment]
     warnings: list[str] = field(default_factory=list)
+    completion_method: str | None = None
+    completion_confidence: float | None = None
 
 
 def load_reference_families(reference_dir: str | Path) -> list[FamilyTemplate]:
@@ -263,18 +271,7 @@ def predict_from_observations(
     if margin < minimum_margin:
         warnings.append(f"Family score margin {margin:.3f} is below minimum {minimum_margin:.3f}.")
     if insufficient_evidence or scores[0].score < minimum_score or margin < minimum_margin:
-        return PredictionResult(
-            status="ambiguous",
-            target=target,
-            selected_family=None,
-            family_scores=scores,
-            score_margin=margin,
-            rotation_deg=None,
-            reflected=None,
-            observed_segments=list(target.segments),
-            predicted_segments=[],
-            warnings=warnings,
-        )
+        return _predict_structural_grid_fallback(target, scores, margin, warnings)
 
     selected = next(family for family in families if family.name == scores[0].family)
     rotation, reflected, spacing_refinement, phase_x, phase_y = alignments[selected.name]
@@ -304,11 +301,73 @@ def predict_from_observations(
         observed_segments=list(target.segments),
         predicted_segments=predicted,
         warnings=warnings,
+        completion_method="family_template",
+        completion_confidence=scores[0].score,
+    )
+
+
+def _predict_structural_grid_fallback(
+    target: ObservedTankGeometry,
+    scores: list[FamilyScore],
+    margin: float,
+    warnings: list[str],
+) -> PredictionResult:
+    """Complete an ambiguous family match from repeated local grid evidence.
+
+    The structural predictor is deliberately reached only after template-family
+    selection declines to choose a confident match.  Its output is adapted into
+    this module's normal result type so callers, reports, and DXF writers have
+    one completion interface.
+    """
+    layout = predict_tank_layout(target)
+    fallback_warnings = [
+        *warnings,
+        "Family matching was ambiguous; completed from repeated structural-grid evidence.",
+        *layout.warnings,
+    ]
+    if not layout.predicted_weld_segments:
+        return PredictionResult(
+            status="ambiguous",
+            target=target,
+            selected_family=None,
+            family_scores=scores,
+            score_margin=margin,
+            rotation_deg=None,
+            reflected=None,
+            observed_segments=list(target.segments),
+            predicted_segments=[],
+            warnings=fallback_warnings,
+        )
+
+    predicted = [
+        PredictedSegment(
+            start=segment.start,
+            end=segment.end,
+            confidence=segment.confidence,
+            confidence_level=segment.confidence_level,
+            family="structural_grid_fallback",
+            template_source_id=f"{segment.prediction_method}:{index}",
+        )
+        for index, segment in enumerate(layout.predicted_weld_segments)
+    ]
+    return PredictionResult(
+        status="completed",
+        target=target,
+        selected_family=None,
+        family_scores=scores,
+        score_margin=margin,
+        rotation_deg=None,
+        reflected=None,
+        observed_segments=list(target.segments),
+        predicted_segments=predicted,
+        warnings=fallback_warnings,
+        completion_method="structural_grid_fallback",
+        completion_confidence=layout.overall_confidence,
     )
 
 
 def save_completed_dxf(result: PredictionResult, filepath: str | Path) -> Path:
-    if result.status != "completed" or result.selected_family is None:
+    if result.status != "completed":
         raise ValueError("A completed DXF is not written for an ambiguous prediction.")
     try:
         import ezdxf
@@ -365,7 +424,12 @@ def save_prediction_report(
         "status": result.status,
         "selected_family": result.selected_family,
         "family_scores": [asdict(score) for score in result.family_scores],
-        "confidence": result.family_scores[0].score if result.family_scores else 0.0,
+        "confidence": (
+            result.completion_confidence
+            if result.completion_confidence is not None
+            else (result.family_scores[0].score if result.family_scores else 0.0)
+        ),
+        "completion_method": result.completion_method,
         "score_margin": result.score_margin,
         "target_center_m": {"x": result.target.tank.center_x, "y": result.target.tank.center_y},
         "target_radius_m": result.target.tank.radius,

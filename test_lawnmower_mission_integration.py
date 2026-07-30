@@ -249,13 +249,8 @@ class LawnmowerMissionIntegrationTests(unittest.TestCase):
         self.assertTrue(all(line.get_linewidth() >= 1.25 for line in profile_outlines))
         figure.clf()
 
-    def test_normal_mission_does_not_call_experimental_outer_guide_generation(self):
-        with patch(
-            "path_planner._add_outer_lawnmower_sections",
-            side_effect=AssertionError("experimental outer guides were invoked"),
-        ):
-            mission = _build_mission_plan_once(_model(), fixed_circular_rows=1)
-
+    def test_normal_mission_contains_no_synthetic_outer_guides(self):
+        mission = _build_mission_plan_once(_model(), fixed_circular_rows=1)
         self.assertFalse(
             any(line.is_outer_extension for line in mission.lawnmower_section_lines)
         )

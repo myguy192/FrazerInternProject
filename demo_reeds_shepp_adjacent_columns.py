@@ -1,20 +1,21 @@
 """One isolated Reeds-Shepp test between adjacent 24ft vertical scan columns.
 
-This script reads the current 24ft mission only to confirm the selected scan
-poses and to obtain the tank center.  It does not modify the mission or the
-planner.  The connector itself always uses the explicit stored pose anchors
-specified for this demonstration.
+This script builds the current 24ft mission, then selects the two adjacent
+full-profile columns nearest the tank center. It does not modify planner
+behavior.
 """
 
 from __future__ import annotations
 
-import json
 import math
+from dataclasses import asdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 
+from dxf_importer import import_dxf
+from path_planner import build_mission_plan
 from reeds_shepp_connector import (
     Pose2D,
     plan_reeds_shepp,
@@ -24,13 +25,11 @@ from reeds_shepp_connector import (
 from scan_profile import RainbowProfileConfig, make_rainbow_profile, transform_profile
 
 
-MISSION_PATH = Path("24ft_final_mission.json")
-OUTPUT_PATH = Path("reeds_shepp_adjacent_columns_24ft.png")
-EXPECTED_ANCHORS = ((-0.6096, 1.72549), (0.6096, 1.23425))
+TANK_DXF_PATH = Path("3 Tank examples") / "24ft.dxf"
+OUTPUT_PATH = Path("output examples") / "reeds_shepp_output_example.png"
 TURN_RADIUS_M = 1.8288
 SAMPLE_STEP_M = 0.05
 TANK_RADIUS_M = 3.6576
-SELECTED_GUIDE_IDS = (1, 2)
 
 
 def _profile_axes_and_robot_pose(pose: dict) -> tuple[Pose2D, tuple[float, float], tuple[float, float]]:
@@ -67,30 +66,34 @@ def _profile_axes_and_robot_pose(pose: dict) -> tuple[Pose2D, tuple[float, float
     return Pose2D(pose["anchor_x_m"], pose["anchor_y_m"], heading), long_unit, short_unit
 
 
-def _load_selected_pose_data() -> tuple[dict, dict, dict, Pose2D, Pose2D]:
-    mission = json.loads(MISSION_PATH.read_text(encoding="utf-8"))
-    poses = mission["poses"]
-    selected: list[dict] = []
-    for guide_id, expected_anchor in zip(SELECTED_GUIDE_IDS, EXPECTED_ANCHORS):
-        candidates = [
-            pose
-            for pose in poses
-            if pose.get("stage") == "interior_vertical"
-            and pose.get("section_id") == guide_id
-            and pose.get("profile_variant") == "full"
-        ]
-        if not candidates:
-            raise RuntimeError(f"No full vertical scan poses found for guide {guide_id}.")
-        top = max(candidates, key=lambda pose: pose["anchor_y_m"])
-        if not (
-            math.isclose(top["anchor_x_m"], expected_anchor[0], abs_tol=1e-4)
-            and math.isclose(top["anchor_y_m"], expected_anchor[1], abs_tol=1e-4)
-        ):
-            raise RuntimeError(f"Guide {guide_id} no longer matches the required stored waypoint.")
-        selected.append(top)
-    start, _start_long, _start_short = _profile_axes_and_robot_pose(selected[0])
-    goal, _goal_long, _goal_short = _profile_axes_and_robot_pose(selected[1])
-    return mission, selected[0], selected[1], start, goal
+def _load_selected_pose_data() -> tuple[dict, tuple[int, int], dict, dict, Pose2D, Pose2D]:
+    mission = asdict(build_mission_plan(import_dxf(TANK_DXF_PATH)))
+    by_guide: dict[int, list[dict]] = {}
+    for pose in mission["poses"]:
+        if pose.get("stage") != "interior_vertical" or pose.get("profile_variant") != "full":
+            continue
+        guide_id = pose.get("section_id")
+        if guide_id is not None:
+            by_guide.setdefault(int(guide_id), []).append(pose)
+    columns = sorted(
+        (
+            (guide_id, max(candidates, key=lambda pose: pose["anchor_y_m"]))
+            for guide_id, candidates in by_guide.items()
+        ),
+        key=lambda item: item[1]["anchor_x_m"],
+    )
+    if len(columns) < 2:
+        raise RuntimeError("The current mission has fewer than two full vertical scan columns.")
+    pair_index = min(
+        range(len(columns) - 1),
+        key=lambda index: abs(
+            (columns[index][1]["anchor_x_m"] + columns[index + 1][1]["anchor_x_m"]) / 2.0
+        ),
+    )
+    (start_guide_id, start_scan), (goal_guide_id, goal_scan) = columns[pair_index : pair_index + 2]
+    start, _start_long, _start_short = _profile_axes_and_robot_pose(start_scan)
+    goal, _goal_long, _goal_short = _profile_axes_and_robot_pose(goal_scan)
+    return mission, (start_guide_id, goal_guide_id), start_scan, goal_scan, start, goal
 
 
 def _plot_profile(ax, pose: dict, color: str, label: str) -> None:
@@ -104,7 +107,7 @@ def _plot_profile(ax, pose: dict, color: str, label: str) -> None:
 
 
 def main() -> int:
-    mission, start_scan, goal_scan, start, goal = _load_selected_pose_data()
+    mission, selected_guide_ids, start_scan, goal_scan, start, goal = _load_selected_pose_data()
     tank_center = mission["tank_center_m"]
     if not math.isclose(mission["tank_radius_m"], TANK_RADIUS_M, abs_tol=1e-9):
         raise RuntimeError("The mission tank radius no longer matches this fixed demo.")
@@ -129,7 +132,7 @@ def main() -> int:
             zorder=1,
         )
     )
-    for guide_id, selected in zip(SELECTED_GUIDE_IDS, (start_scan, goal_scan)):
+    for guide_id, selected in zip(selected_guide_ids, (start_scan, goal_scan)):
         guide_poses = [
             pose
             for pose in mission["poses"]
@@ -142,7 +145,7 @@ def main() -> int:
             color="#94a3b8",
             linewidth=1.5,
             alpha=0.65,
-            label="Selected vertical columns" if guide_id == SELECTED_GUIDE_IDS[0] else "_nolegend_",
+            label="Selected vertical columns" if guide_id == selected_guide_ids[0] else "_nolegend_",
             zorder=2,
         )
 
@@ -202,10 +205,11 @@ def main() -> int:
     ax.grid(True, alpha=0.22)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUTPUT_PATH, dpi=180)
     plt.close(fig)
 
-    print(f"guide_ids={SELECTED_GUIDE_IDS}")
+    print(f"guide_ids={selected_guide_ids}")
     print(f"start={start}")
     print(f"goal={goal}")
     print(f"anchor_distance_m={math.dist((start.x, start.y), (goal.x, goal.y)):.9f}")

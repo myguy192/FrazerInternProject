@@ -1,89 +1,84 @@
-# ROS2 Coverage Path Planner for Circular Tank Inspection
+# Tank Inspection Coverage Planner
 
-A ROS2 Jazzy node that generates and publishes an Archimedean spiral coverage path for robotic inspection of circular above-ground crude oil storage tanks. Built for Applied Impact Robotics.
+This repository turns circular-tank DXF geometry into inspection scan plans,
+simulates incomplete circular-scan observations, and completes the missing
+structural grid from known tank families or repeated-grid evidence.
 
-## What It Does
+The current planner uses exact geometry and one authoritative interior gate:
+a full or half scan profile must contribute at least 40% new coverage. The
+Reeds–Shepp connector is an isolated MVP and is not yet integrated into the
+mission path.
 
-The planner generates a continuous spiral path starting from the tank manway, covering the entire tank floor while navigating around internal structural columns. The path is published as a `nav_msgs/Path` message over ROS2, making it directly compatible with downstream navigation and control nodes.
+## Setup
 
-The path is computed once on startup and republished every second, ensuring any node that comes online late still receives the full coverage path.
+Python 3.12 or newer is recommended.
 
-## Algorithm
-
-- Builds a base Archimedean spiral parameterized by tank radius, pass spacing, and sample arc length
-- Projects each waypoint into free space using an iterative obstacle avoidance pass that pushes points away from column exclusion zones and the tank wall
-- Smooths the projected path using a moving average filter to reduce sharp direction changes
-- Computes tangent and inward normal vectors at each waypoint for downstream sensor orientation control
-
-For a 15m radius tank with 0.31m pass spacing, the planner generates approximately 35,000 waypoints at 0.06m arc length resolution.
-
-## Stack
-
-- ROS2 Jazzy on Ubuntu 24.04
-- Python 3.12
-- numpy
-
-## Usage
-```bash
-cd ~/ros2_ws
-colcon build --packages-select my_first_pkg
-source install/setup.bash
-ros2 launch my_first_pkg my_launch.py
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -v
 ```
 
-In a second terminal, visualize the path in RViz2:
-```bash
-rviz2
+## Main files
+
+- `path_planner.py` — production circular-edge and interior lawnmower planner.
+- `dxf_importer.py` — supported DXF parsing and geometry normalization.
+- `missing_dxf_generator.py` — creates partial observations from circular scans.
+- `dxf_family_matcher.py` — classifies and completes partial tank layouts.
+- `grid_predictor.py` — structural-grid fallback used when family matching is ambiguous.
+- `reeds_shepp_connector.py` — standalone curvature-constrained connector MVP.
+- `overlap_coverage_experiment.py` — canonical raw-points coverage experiment.
+- `demo_reeds_shepp_adjacent_columns.py` — reproducible 24ft connector demo.
+- `HANDOFF.md` — architecture, workflows, limitations, and every retained file.
+
+## Run the planner
+
+```powershell
+python path_planner.py "3 Tank examples/24ft.dxf" `
+  --no-plot `
+  --save-json= `
+  --save-plot "output examples/path_planner_24ft.png"
 ```
 
-Add a Path display, set the topic to `/coverage_path`, and set the fixed frame to `map`.
+Replace `24ft` with `65ft` or `150ft` for the other reference tanks.
 
-## Published Topics
+## Run DXF completion
 
-| Topic | Type | Description |
-| `/coverage_path` | `nav_msgs/Path` | Spiral coverage waypoints in the map frame |
+Generate a partial observation:
 
-## Parameters (coverage_planner.py)
-
-| Parameter | Value | Description |
-
-| `TANK_RADIUS` | 15.0 m | Tank inner radius |
-| `PASS_SPACING` | 0.31 m | Distance between spiral passes |
-| `SCAN_WIDTH` | 0.364 m | Sensor scan width |
-| `COLUMN_RADIUS` | 0.3 m | Structural column radius |
-| `COLUMN_CLEARANCE` | 0.3 m | Clearance margin around columns |
-| `SAMPLE_ARC_LENGTH` | 0.06 m | Distance between waypoints |
-
-## DXF Importer v1
-
-`dxf_importer.py` imports and visualizes tank floor DXF geometry before any planning step.
-
-Install the DXF parser dependency:
-```bash
-pip install ezdxf
+```powershell
+python missing_dxf_generator.py "3 Tank examples/24ft.dxf" `
+  --circular-rows 1 `
+  --output "output examples/uncompleted_dxf_24.dxf" `
+  --save-preview "output examples/uncompleted_dxf_24.png"
 ```
 
-Run the importer with plotting:
-```bash
-python dxf_importer.py path/to/tank_floor.dxf
+Complete it:
+
+```powershell
+python dxf_family_matcher.py "output examples/uncompleted_dxf_24.dxf" `
+  --reference-dir "3 Tank examples" `
+  --save-dxf "output examples/dxf_completed_24ft.dxf" `
+  --save-plot "output examples/dxf_completed_24ft.png" `
+  --save-report "output examples/dxf_completed_24ft_report.json"
 ```
 
-Run only the import summary:
-```bash
-python dxf_importer.py path/to/tank_floor.dxf --no-plot
+The 24ft example uses one circular row; the 65ft and 150ft examples use two.
+
+## Run maintained analysis tools
+
+```powershell
+python overlap_coverage_experiment.py
+python demo_reeds_shepp_adjacent_columns.py
 ```
 
-Save a plot image without opening a window:
-```bash
-python dxf_importer.py path/to/tank_floor.dxf --no-plot --save-plot imported_geometry.png
-```
+Both commands update their single canonical PNG in `output examples`.
 
-Supported v1 modelspace entities:
+## Current limitations
 
-- `LINE`
-- `LWPOLYLINE`
-- `POLYLINE`
-- `ARC`
-- `CIRCLE`
-
-Unsupported entities are reported in the summary instead of stopping the import. The importer preserves raw entity metadata, layer names, supported geometry objects, and simple drawing bounds so later tools can add tank boundary detection, plate detection, weld extraction, node generation, and scan profile placement.
+- Reeds–Shepp paths validate the robot centerline against the tank boundary;
+  robot footprint and internal-obstacle collision checks are future work.
+- The connector is not yet inserted between mission scan poses.
+- DXF family completion is trained only on the three supplied reference tanks.
+- The structural-grid fallback requires enough repeated line evidence.
+- The overlap graph runs exact planning repeatedly and is intentionally slow.
+- This is an offline Python planning/validation base, not a ROS2 runtime node.
