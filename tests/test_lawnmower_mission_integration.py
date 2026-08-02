@@ -49,7 +49,8 @@ def _model():
 
 class LawnmowerMissionIntegrationTests(unittest.TestCase):
     def test_24ft_uses_one_stronger_circular_row_and_symmetric_vertical_columns(self):
-        model = import_dxf(Path("3 Tank examples") / "24ft.dxf")
+        root = Path(__file__).resolve().parents[1]
+        model = import_dxf(root / "examples" / "inputs" / "24ft.dxf")
 
         mission = _build_mission_plan_once(model)
         vertical_lines = [

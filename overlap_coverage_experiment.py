@@ -23,13 +23,13 @@ import path_planner as planner
 from scan_profile import RainbowProfileConfig
 
 
-ROOT = Path(__file__).parent
+ROOT = Path(__file__).resolve().parent
 TANKS = (
-    ("24ft", ROOT / "3 Tank examples" / "24ft.dxf"),
-    ("65ft", ROOT / "3 Tank examples" / "65ft.dxf"),
-    ("150ft", ROOT / "3 Tank examples" / "150ft.dxf"),
+    ("24ft", ROOT / "examples" / "inputs" / "24ft.dxf"),
+    ("65ft", ROOT / "examples" / "inputs" / "65ft.dxf"),
+    ("150ft", ROOT / "examples" / "inputs" / "150ft.dxf"),
 )
-OUTPUT_PATH = ROOT / "output examples" / "overlap_vs_coverage.png"
+OUTPUT_PATH = ROOT / "examples" / "outputs" / "overlap_vs_coverage.png"
 GRID_RESOLUTION = 220
 SWEEP_PERCENTAGES = tuple(float(value) for value in range(0, 101, 20))
 PLOT_STYLES = {

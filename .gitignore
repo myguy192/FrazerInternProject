@@ -207,7 +207,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Tank planner generated outputs
+# Tank planner generated outputs. Curated artifacts under examples/outputs are tracked.
 *.pyc
 mission_plan.json
 mission_plan.csv

@@ -28,9 +28,9 @@ from scan_profile import RainbowProfileConfig
 from grid_predictor import clip_geometry_to_observed_region, observed_geometry_from_dxf
 
 
-ROOT = Path(__file__).parent
-EXAMPLES = ROOT / "3 Tank examples"
-OUTPUT_EXAMPLES = ROOT / "output examples"
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES = ROOT / "examples" / "inputs"
+OUTPUT_EXAMPLES = ROOT / "examples" / "outputs"
 
 
 class DxfPredictionWorkflowTests(unittest.TestCase):

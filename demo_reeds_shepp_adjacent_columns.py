@@ -25,8 +25,9 @@ from reeds_shepp_connector import (
 from scan_profile import RainbowProfileConfig, make_rainbow_profile, transform_profile
 
 
-TANK_DXF_PATH = Path("3 Tank examples") / "24ft.dxf"
-OUTPUT_PATH = Path("output examples") / "reeds_shepp_output_example.png"
+ROOT = Path(__file__).resolve().parent
+TANK_DXF_PATH = ROOT / "examples" / "inputs" / "24ft.dxf"
+OUTPUT_PATH = ROOT / "examples" / "outputs" / "reeds_shepp_output_example.png"
 TURN_RADIUS_M = 1.8288
 SAMPLE_STEP_M = 0.05
 TANK_RADIUS_M = 3.6576

@@ -13,7 +13,7 @@ import numpy as np
 from shapely.geometry.base import BaseGeometry
 
 from dxf_importer import DxfImportError, GeometryModel, import_dxf
-from half_profile_gap_fill import (
+from coverage_geometry import (
     as_polygon,
     build_candidate_valid_region,
     polygon_union,
