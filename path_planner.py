@@ -3,14 +3,22 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from shapely.geometry.base import BaseGeometry
 
 from dxf_importer import DxfImportError, GeometryModel, import_dxf
+from coverage_geometry import (
+    as_polygon,
+    build_candidate_valid_region,
+    polygon_union,
+)
+from partial_scan_profile import make_rainbow_profile_halves, transform_rainbow_half
 from scan_profile import RainbowProfileConfig, make_rainbow_profile, transform_profile
 
 
@@ -21,21 +29,40 @@ DEFAULT_SPACING_FACTOR = 1.0
 # directly from measured neighboring-polygon overlap.
 DEFAULT_CIRCULAR_SPACING_CANDIDATES = (1.0,)
 DEFAULT_MAX_CIRCULAR_ROWS = 2
-TARGET_COVERAGE_PERCENT = 95.0
 DEFAULT_MAX_CIRCULAR_GAP_FRACTION = 0.05
 DEFAULT_CIRCULAR_STOP_BACKOFF_ROWS = 3
 DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.04
+DEFAULT_SINGLE_ROW_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION = 0.06
 MIN_CIRCULAR_OVERLAP_FRACTION = 0.01
-MAX_CIRCULAR_OVERLAP_FRACTION = 0.04
+MAX_CIRCULAR_OVERLAP_FRACTION = 0.08
 DEFAULT_VERTICAL_SPACING_FACTOR = 0.95
 DEFAULT_OVERLAP_DISCARD_THRESHOLD = 0.50
 DEFAULT_VERTICAL_COLUMN_EDGE_OVERLAP_LIMIT = 1.0 / 3.0
+DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION = 0.02
+GEOMETRY_EPSILON = 1e-8
+MIN_NEW_COVERAGE_FRACTION = 0.40
+MAX_EXPECTED_NEIGHBOR_OVERLAP_FRACTION = 0.04
+MIN_FULL_INSIDE_FRACTION = 0.80
+MAX_FULL_OUTSIDE_FRACTION = 0.20
+MIN_HALF_INSIDE_FRACTION = 0.80
+MAX_HALF_OUTSIDE_FRACTION = 0.20
 SIDE_GUARD_HEADING_RAD = math.pi / 2.0
 DEFAULT_JSON_PATH = "mission_plan.json"
 DEFAULT_PLOT_PATH = "mission_preview.png"
 VERTICAL_SLOPE_TOLERANCE = 0.02
 VERTICAL_X_GROUP_TOLERANCE_M = 0.02
 VERTICAL_LINE_COVERAGE_RATIO = 0.60
+HORIZONTAL_Y_GROUP_TOLERANCE_M = VERTICAL_X_GROUP_TOLERANCE_M
+HORIZONTAL_FRAGMENT_MERGE_GAP_M = 0.05
+HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION = 0.15
+HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M = 0.08
+PERPENDICULAR_SECTION_CLEARANCE_M = 0.02
+SECTION_BOUNDARY_MATCH_TOLERANCE_M = 0.03
+LAWN_SYMMETRY_POSITION_TOLERANCE_M = SECTION_BOUNDARY_MATCH_TOLERANCE_M
+LAWN_SYMMETRY_POLYGON_ERROR_TOLERANCE = 5e-4
+SECTION_MIN_LENGTH_M = 1e-6
+INTERIOR_POSE_POSITION_TOLERANCE_M = 0.01
+INTERIOR_POSE_ANGLE_TOLERANCE_RAD = math.radians(1.0)
 OVERLAP_SAMPLE_GRID_SIZE = 28
 CIRCULAR_GAP_TOLERANCE_M = 0.002
 CIRCULAR_TEST_BAND_HALF_WIDTH_M = 0.005
@@ -45,6 +72,7 @@ CIRCULAR_OVERLAP_TIE_FRACTION = 0.0025
 CIRCULAR_OVERLAP_SAMPLE_GRID_SIZE = 48
 CIRCULAR_MAX_PROFILE_COUNT = 10000
 _TOUCHING_ANGULAR_STEP_CACHE: dict[tuple[float, float, float, float, int], float] = {}
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,6 +98,15 @@ class SweepPose:
     theta_rad: float | None = None
     sweep_radius_m: float | None = None
     status: str = "kept"
+    orientation: str | None = None
+    group_id: int | None = None
+    section_id: int | None = None
+    travel_direction: str | None = None
+    profile_variant: str = "full"
+    anchor_x_m: float | None = None
+    anchor_y_m: float | None = None
+    parent_full_x_m: float | None = None
+    parent_full_y_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +117,146 @@ class VerticalPlateColumn:
     right_weld_x_m: float
     min_y_m: float
     max_y_m: float
+
+
+@dataclass(frozen=True)
+class InteriorSection:
+    section_id: int
+    group_id: int
+    orientation: str
+    center_cross_m: float
+    lower_weld_coordinate_m: float
+    upper_weld_coordinate_m: float
+    progress_min_m: float
+    progress_max_m: float
+    source_segment_count: int = 0
+
+
+@dataclass(frozen=True)
+class LawnmowerSectionLine:
+    """One deterministically ordered straight interior section."""
+
+    line_id: int
+    orientation: str
+    order_index: int
+    source_section_id: int
+    start_m: tuple[float, float]
+    end_m: tuple[float, float]
+    is_outer_extension: bool = False
+
+
+@dataclass(frozen=True)
+class LawnmowerScanPlacement:
+    """One rainbow profile anchored by its long-side midpoint on a guide line."""
+
+    placement_id: int
+    guide_line_id: int
+    guide_order_index: int
+    placement_index: int
+    orientation: str
+    travel_direction: str
+    anchor_m: tuple[float, float]
+    profile_origin_m: tuple[float, float]
+    heading_rad: float
+    heading_deg: float
+    profile_variant: str = "full"
+    parent_profile_origin_m: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class LawnmowerCandidateMetrics:
+    total_area_m2: float
+    inside_area_m2: float
+    outside_area_m2: float
+    inside_fraction: float
+    outside_fraction: float
+    total_overlap_area_m2: float
+    expected_neighbor_overlap_area_m2: float
+    harmful_overlap_area_m2: float
+    harmful_overlap_fraction: float
+    new_area_m2: float
+    new_fraction: float
+
+
+@dataclass(frozen=True)
+class LawnmowerCandidateRecord:
+    candidate_id: int
+    guide_line_id: int
+    guide_order_index: int
+    placement_index: int
+    orientation: str
+    travel_direction: str
+    projected_position_m: float
+    anchor_m: tuple[float, float]
+    profile_origin_m: tuple[float, float]
+    heading_rad: float
+    heading_deg: float
+    full_polygon: np.ndarray
+    left_half_polygon: np.ndarray
+    right_half_polygon: np.ndarray
+    candidate_source: str
+    candidate_stage: str
+    symmetry_pair_id: str | None = None
+    acceptance_result: str = "pending"
+    rejection_reasons: tuple[str, ...] = ()
+    full_metrics: LawnmowerCandidateMetrics | None = None
+    left_half_metrics: LawnmowerCandidateMetrics | None = None
+    right_half_metrics: LawnmowerCandidateMetrics | None = None
+
+
+@dataclass(frozen=True)
+class AcceptedLawnmowerCoverage:
+    guide_line_id: int
+    orientation: str
+    projected_position_m: float
+    profile_variant: str
+    polygon: np.ndarray
+    inside_area_m2: float
+
+
+@dataclass(frozen=True)
+class LawnmowerGatingPass:
+    placements: list[LawnmowerScanPlacement]
+    candidates: list[LawnmowerCandidateRecord]
+    retained_guide_ids: list[int]
+    discarded_guide_ids: list[int]
+    guide_pair_ids: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LawnmowerGuidePair:
+    """One stable mirror pair, or one axis/single guide when ``right_line_id`` is absent."""
+
+    pair_id: str
+    orientation: str
+    left_line_id: int
+    right_line_id: int | None
+    cross_mirror_error_m: float
+    longitudinal_interval_m: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class LawnmowerSymmetryPlan:
+    """Geometry-only mirror pairing used by candidate generation and gating."""
+
+    pairs: tuple[LawnmowerGuidePair, ...]
+    symmetric_orientations: tuple[str, ...]
+    duplicate_line_ids: tuple[int, ...]
+    common_four_vertical_interval_m: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class LawnmowerSymmetryMetrics:
+    """Reusable mirror errors for one accepted guide pair."""
+
+    pair_id: str
+    orientation: str
+    first_line_id: int
+    second_line_id: int
+    cross_mirror_error_m: float
+    scan_count_difference: int
+    maximum_anchor_error_m: float
+    maximum_polygon_error_fraction: float
 
 
 @dataclass(frozen=True)
@@ -161,6 +338,16 @@ class OuterEdgeSweepMission:
     poses: list[SweepPose]
     source_dxf: str | None = None
     tank_estimate_method: str = "bounds"
+    horizontal_sections: list[InteriorSection] = field(default_factory=list)
+    vertical_group_count: int = 0
+    horizontal_group_count: int = 0
+    vertical_scan_count: int = 0
+    horizontal_scan_count: int = 0
+    duplicate_poses_removed: int = 0
+    invalid_horizontal_segments_skipped: int = 0
+    lawnmower_section_lines: list[LawnmowerSectionLine] = field(default_factory=list)
+    rejected_full_profile_candidate_count: int = 0
+    salvaged_half_profile_count: int = 0
 
 
 def estimate_tank_circle_from_geometry(model: GeometryModel) -> TankCircleEstimate:
@@ -191,7 +378,7 @@ def predict_tank_layout_from_geometry(
     scan_profile: Any | None = None,
 ) -> Any:
     """Explicit opt-in bridge from imported geometry to the standalone layout predictor."""
-    from tank_layout_predictor import (
+    from grid_predictor import (
         observed_geometry_from_circular_sweeps,
         observed_geometry_from_dxf,
         predict_tank_layout,
@@ -360,8 +547,6 @@ def _ranked_circular_profile_counts(
     upper = min(CIRCULAR_MAX_PROFILE_COUNT, initial_pose_count + CIRCULAR_PROFILE_COUNT_SEARCH_RADIUS)
     direction_sign = -1.0 if clockwise else 1.0
     first_profile = transform_profile(local_profile, sweep_radius, 0.0, 0.0)
-    local_samples = _profile_interior_sample_points(local_profile)
-    first_samples = transform_profile(local_samples, sweep_radius, 0.0, 0.0)
     candidates: list[tuple[int, float]] = []
 
     for pose_count in range(lower, upper + 1):
@@ -372,19 +557,11 @@ def _ranked_circular_profile_counts(
             sweep_radius * math.sin(angular_spacing),
             _normalize_angle(angular_spacing),
         )
-        second_samples = transform_profile(
-            local_samples,
-            sweep_radius * math.cos(angular_spacing),
-            sweep_radius * math.sin(angular_spacing),
-            _normalize_angle(angular_spacing),
-        )
         if not _is_usable_profile_polygon(second_profile):
             continue
-        overlap_fraction = _estimate_neighbor_overlap_fraction(
+        overlap_fraction = _exact_circular_neighbor_overlap_fraction(
             first_profile,
             second_profile,
-            first_sample_points=first_samples,
-            second_sample_points=second_samples,
         )
         if overlap_fraction >= MIN_CIRCULAR_OVERLAP_FRACTION:
             candidates.append((pose_count, overlap_fraction))
@@ -425,23 +602,18 @@ def _verify_circular_row_coverage(
     wraparound_passed = False
     overlap_fractions: list[float] = []
     pair_gap_results: list[bool] = []
-    local_samples = _profile_interior_sample_points(local_profile)
-    world_sample_sets = [
-        transform_profile(local_samples, pose.x_m, pose.y_m, pose.heading_rad)
-        for pose in poses
-    ]
+    _ = local_profile
 
     for index, first_profile in enumerate(world_profiles):
         next_index = (index + 1) % len(world_profiles)
         second_profile = world_profiles[next_index]
-        overlap_fraction = _estimate_neighbor_overlap_fraction(
+        overlap_fraction = _exact_circular_neighbor_overlap_fraction(
             first_profile,
             second_profile,
-            first_sample_points=world_sample_sets[index],
-            second_sample_points=world_sample_sets[next_index],
         )
         overlap_fractions.append(overlap_fraction)
-        neighbor_gap = 0.0 if overlap_fraction > 0.0 else _polygon_distance(first_profile, second_profile)
+        exact_overlap = overlap_fraction > GEOMETRY_EPSILON
+        neighbor_gap = 0.0 if exact_overlap else _polygon_distance(first_profile, second_profile)
         max_neighbor_gap = max(max_neighbor_gap, neighbor_gap)
         overlap_passed = overlap_fraction >= minimum_overlap_fraction
 
@@ -454,7 +626,7 @@ def _verify_circular_row_coverage(
             first_profile,
             second_profile,
         )
-        no_gap = overlap_fraction > 0.0 and band_passed
+        no_gap = exact_overlap and band_passed
         pair_gap_results.append(no_gap)
         pair_passed = overlap_passed and no_gap
         if next_index == 0:
@@ -526,6 +698,21 @@ def _estimate_neighbor_overlap_fraction(
     )
 
 
+def _exact_circular_neighbor_overlap_fraction(
+    first_profile: np.ndarray,
+    second_profile: np.ndarray,
+) -> float:
+    """Return exact Shapely intersection area over the smaller profile area."""
+    if not _is_usable_profile_polygon(first_profile) or not _is_usable_profile_polygon(second_profile):
+        return 0.0
+    first_geometry = as_polygon(first_profile)
+    second_geometry = as_polygon(second_profile)
+    denominator = min(float(first_geometry.area), float(second_geometry.area))
+    if denominator <= GEOMETRY_EPSILON:
+        return 0.0
+    return float(first_geometry.intersection(second_geometry).area) / denominator
+
+
 def _profile_interior_sample_points(local_profile: np.ndarray) -> np.ndarray:
     """Return a rotation-stable uniform sample of the local profile interior."""
     min_x, min_y, max_x, max_y = _polygon_bounds(local_profile)
@@ -580,6 +767,51 @@ def _is_usable_profile_polygon(polygon: np.ndarray) -> bool:
     )
 
 
+def determine_max_feasible_circular_rows(
+    tank_radius: float,
+    *,
+    outer_edge_offset_m: float = DEFAULT_EDGE_OFFSET_FROM_WALL,
+    row_spacing_m: float = DEFAULT_ROW_SPACING,
+    profile_config: RainbowProfileConfig | None = None,
+    minimum_turning_radius_m: float | None = None,
+    preferred_max_rows: int = DEFAULT_MAX_CIRCULAR_ROWS,
+) -> int:
+    """Return the geometry-supported circular-row limit, capped by preference.
+
+    In the absence of a separate robot turning-radius constant, the full scan
+    footprint width is the conservative minimum usable path radius. This keeps
+    a circular robot path from becoming tighter than the footprint it carries.
+    Every generated row must still pass the existing polygon continuity,
+    overlap, no-gap, and wraparound checks before mission acceptance.
+    """
+    if tank_radius <= 0.0:
+        raise ValueError("Tank radius must be positive.")
+    if outer_edge_offset_m < 0.0:
+        raise ValueError("Outer edge offset must be non-negative.")
+    if row_spacing_m <= 0.0:
+        raise ValueError("Row spacing must be positive.")
+    if preferred_max_rows < 0:
+        raise ValueError("Preferred circular row count must be zero or greater.")
+    if minimum_turning_radius_m is not None and minimum_turning_radius_m <= 0.0:
+        raise ValueError("Minimum turning radius must be positive when provided.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    minimum_usable_radius = max(
+        profile_config.width,
+        minimum_turning_radius_m or 0.0,
+    )
+    sweep_radius = _profile_constrained_sweep_radius(
+        tank_radius,
+        profile_config,
+        outer_edge_offset_m,
+    )
+    feasible_rows = 0
+    while feasible_rows < preferred_max_rows and sweep_radius >= minimum_usable_radius:
+        feasible_rows += 1
+        sweep_radius -= row_spacing_m
+    return feasible_rows
+
+
 def _generate_circular_sweep_plan(
     tank_center: tuple[float, float],
     tank_radius: float,
@@ -602,11 +834,23 @@ def _generate_circular_sweep_plan(
     )
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     current_radius = _profile_constrained_sweep_radius(tank_radius, profile_config, outer_edge_offset_m)
+    max_feasible_rows = determine_max_feasible_circular_rows(
+        tank_radius,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        profile_config=profile_config,
+        preferred_max_rows=DEFAULT_MAX_CIRCULAR_ROWS,
+    )
     rows: list[CircularSweepRow] = []
     poses: list[SweepPose] = []
     start_theta = 0.0
+    target_overlap_fraction = (
+        DEFAULT_SINGLE_ROW_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION
+        if max_feasible_rows == 1
+        else DEFAULT_CIRCULAR_NEIGHBOR_OVERLAP_FRACTION
+    )
 
-    while current_radius > profile_config.width / 2.0 and len(rows) < DEFAULT_MAX_CIRCULAR_ROWS:
+    while len(rows) < max_feasible_rows:
         generated = _generate_sweep_row_poses(
             tank_center,
             current_radius,
@@ -617,6 +861,7 @@ def _generate_circular_sweep_plan(
             scan_id_start=len(poses),
             start_theta=start_theta,
             clockwise=clockwise,
+            target_overlap_fraction=target_overlap_fraction,
         )
         if generated is None:
             return _apply_circular_stop_backoff(
@@ -636,8 +881,8 @@ def _generate_circular_sweep_plan(
         start_theta = row_poses[-1].theta_rad
         current_radius -= row_spacing_m
 
-    if len(rows) >= DEFAULT_MAX_CIRCULAR_ROWS:
-        return CircularSweepPlan(rows, poses, current_radius, "max_circular_rows")
+    if len(rows) >= max_feasible_rows:
+        return CircularSweepPlan(rows, poses, current_radius, "geometry_row_limit")
 
     return _apply_circular_stop_backoff(rows, poses, current_radius, "radius", circular_stop_backoff_rows)
 
@@ -664,13 +909,18 @@ def _generate_fixed_circular_sweep_plan(
 
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
     current_radius = _profile_constrained_sweep_radius(tank_radius, profile_config, outer_edge_offset_m)
+    max_feasible_rows = determine_max_feasible_circular_rows(
+        tank_radius,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        profile_config=profile_config,
+        preferred_max_rows=fixed_circular_rows,
+    )
     rows: list[CircularSweepRow] = []
     poses: list[SweepPose] = []
     start_theta = 0.0
 
-    for row_id in range(fixed_circular_rows):
-        if current_radius <= profile_config.width / 2.0:
-            return CircularSweepPlan(rows, poses, current_radius, "radius")
+    for row_id in range(max_feasible_rows):
         generated = _generate_sweep_row_poses(
             tank_center,
             current_radius,
@@ -694,7 +944,8 @@ def _generate_fixed_circular_sweep_plan(
         start_theta = row_poses[-1].theta_rad
         current_radius -= row_spacing_m
 
-    return CircularSweepPlan(rows, poses, None, "fixed_row_count")
+    stop_reason = "fixed_row_count" if max_feasible_rows == fixed_circular_rows else "geometry_row_limit"
+    return CircularSweepPlan(rows, poses, current_radius, stop_reason)
 
 
 def _apply_circular_stop_backoff(
@@ -797,6 +1048,13 @@ def build_outer_edge_sweep_mission(
         vertical_spacing_factor=DEFAULT_VERTICAL_SPACING_FACTOR,
         overlap_discard_threshold=DEFAULT_OVERLAP_DISCARD_THRESHOLD,
         vertical_columns=[],
+        horizontal_sections=[],
+        vertical_group_count=0,
+        horizontal_group_count=0,
+        vertical_scan_count=0,
+        horizontal_scan_count=0,
+        duplicate_poses_removed=0,
+        invalid_horizontal_segments_skipped=0,
         edge_sweep_scan_count=len(circular_plan.poses),
         interior_kept_count=0,
         interior_discarded_count=0,
@@ -848,27 +1106,67 @@ def _build_mission_plan_once(
             overlap_discard_threshold=overlap_discard_threshold,
         )
 
-    tank = estimate_tank_circle_from_geometry(model)
-    columns = detect_vertical_plate_columns(model, tank)
-    interior_poses, discarded_count = generate_interior_vertical_poses(
-        columns,
-        tank,
+    guide_lines = generate_lawnmower_section_lines(model)
+    gating_pass = gate_lawnmower_candidates(
+        guide_lines,
+        TankCircleEstimate(
+            center_x=edge_mission.tank_center_m["x"],
+            center_y=edge_mission.tank_center_m["y"],
+            radius=edge_mission.tank_radius_m,
+            method=edge_mission.tank_estimate_method,
+        ),
         edge_mission.poses,
-        scan_id_start=len(edge_mission.poses),
         profile_config=profile_config,
-        vertical_spacing_factor=vertical_spacing_factor,
-        overlap_discard_threshold=overlap_discard_threshold,
     )
+    lawnmower_poses = _lawnmower_placements_to_sweep_poses(
+        guide_lines,
+        gating_pass.placements,
+        scan_id_start=len(edge_mission.poses),
+    )
+    combined_interior, duplicate_count = _deduplicate_interior_poses(
+        lawnmower_poses,
+        scan_id_start=len(edge_mission.poses),
+    )
+    vertical_group_ids = {
+        pose.group_id
+        for pose in combined_interior
+        if pose.stage == "interior_vertical" and pose.group_id is not None
+    }
+    horizontal_group_ids = {
+        pose.group_id
+        for pose in combined_interior
+        if pose.stage == "interior_horizontal" and pose.group_id is not None
+    }
+    vertical_scan_count = sum(pose.stage == "interior_vertical" for pose in combined_interior)
+    horizontal_scan_count = sum(pose.stage == "interior_horizontal" for pose in combined_interior)
     return replace(
         edge_mission,
         interior_enabled=True,
         vertical_spacing_factor=vertical_spacing_factor,
         overlap_discard_threshold=overlap_discard_threshold,
-        vertical_columns=columns,
-        interior_kept_count=len(interior_poses),
-        interior_discarded_count=discarded_count,
-        total_scan_count=len(edge_mission.poses) + len(interior_poses),
-        poses=edge_mission.poses + interior_poses,
+        vertical_columns=[],
+        horizontal_sections=[],
+        vertical_group_count=len(vertical_group_ids),
+        horizontal_group_count=len(horizontal_group_ids),
+        vertical_scan_count=vertical_scan_count,
+        horizontal_scan_count=horizontal_scan_count,
+        duplicate_poses_removed=duplicate_count,
+        invalid_horizontal_segments_skipped=0,
+        interior_kept_count=len(combined_interior),
+        interior_discarded_count=(
+            len(gating_pass.candidates) - len(gating_pass.placements)
+        ),
+        total_scan_count=len(edge_mission.poses) + len(combined_interior),
+        poses=edge_mission.poses + combined_interior,
+        lawnmower_section_lines=guide_lines,
+        rejected_full_profile_candidate_count=sum(
+            candidate.acceptance_result != "accepted_full"
+            for candidate in gating_pass.candidates
+        ),
+        salvaged_half_profile_count=sum(
+            placement.profile_variant in {"left_half", "right_half"}
+            for placement in gating_pass.placements
+        ),
     )
 
 
@@ -887,139 +1185,43 @@ def build_mission_plan(
     profile_config: RainbowProfileConfig | None = None,
     clockwise: bool = False,
 ) -> OuterEdgeSweepMission:
-    """Build a mission, selecting the circular row strategy when candidates are enabled."""
+    """Build one mission using the authoritative geometry-derived row limit."""
     profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    mission = _build_mission_plan_once(
+        model,
+        outer_edge_offset_m=outer_edge_offset_m,
+        row_spacing_m=row_spacing_m,
+        spacing_factor=spacing_factor,
+        max_circular_gap_fraction=max_circular_gap_fraction,
+        circular_stop_backoff_rows=circular_stop_backoff_rows,
+        vertical_spacing_factor=vertical_spacing_factor,
+        overlap_discard_threshold=overlap_discard_threshold,
+        interior_enabled=interior_enabled,
+        profile_config=profile_config,
+        clockwise=clockwise,
+    )
     if not circular_spacing_candidates:
-        return _build_mission_plan_once(
-            model,
-            outer_edge_offset_m=outer_edge_offset_m,
-            row_spacing_m=row_spacing_m,
-            spacing_factor=spacing_factor,
-            max_circular_gap_fraction=max_circular_gap_fraction,
-            circular_stop_backoff_rows=circular_stop_backoff_rows,
-            vertical_spacing_factor=vertical_spacing_factor,
-            overlap_discard_threshold=overlap_discard_threshold,
-            interior_enabled=interior_enabled,
-            profile_config=profile_config,
-            clockwise=clockwise,
-        )
+        return mission
 
-    candidate_missions: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]] = []
-    for row_count in range(DEFAULT_MAX_CIRCULAR_ROWS + 1):
-        try:
-            mission = _build_mission_plan_once(
-                model,
-                outer_edge_offset_m=outer_edge_offset_m,
-                row_spacing_m=row_spacing_m,
-                spacing_factor=spacing_factor,
-                fixed_circular_rows=row_count,
-                max_circular_gap_fraction=max_circular_gap_fraction,
-                circular_stop_backoff_rows=circular_stop_backoff_rows,
-                vertical_spacing_factor=vertical_spacing_factor,
-                overlap_discard_threshold=overlap_discard_threshold,
-                interior_enabled=interior_enabled,
-                profile_config=profile_config,
-                clockwise=clockwise,
-            )
-        except ValueError:
-            continue
-        if len(mission.circular_rows) != row_count:
-            continue
-        coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
-        travel_distance = _estimate_mission_travel_distance(mission.poses)
-        candidate_missions.append((row_count, None, mission, coverage, travel_distance))
-
-    if not candidate_missions:
-        raise ValueError("No valid circular spacing candidates were provided.")
-
-    selected = _select_circular_spacing_candidate(candidate_missions)
-
-    selected_rows, selected_factor, selected_mission, _selected_coverage, _selected_travel = selected
-    candidate_records = [
-        CircularSpacingCandidate(
-            circular_rows=row_count,
-            spacing_factor=factor,
-            coverage_percent=coverage.covered_percent,
-            scan_count=len(mission.poses),
-            travel_distance_m=travel_distance,
-            selected=row_count == selected_rows
-            and (
-                (factor is None and selected_factor is None)
-                or (factor is not None and selected_factor is not None and math.isclose(factor, selected_factor))
-            ),
-        )
-        for row_count, factor, mission, coverage, travel_distance in candidate_missions
-    ]
+    coverage = _estimate_tank_coverage(mission, profile_config, grid_resolution=80)
+    candidate_record = CircularSpacingCandidate(
+        circular_rows=len(mission.circular_rows),
+        spacing_factor=None,
+        coverage_percent=coverage.covered_percent,
+        scan_count=len(mission.poses),
+        travel_distance_m=_estimate_mission_travel_distance(mission.poses),
+        selected=True,
+    )
+    row_count = len(mission.circular_rows)
     return replace(
-        selected_mission,
+        mission,
         spacing_factor=spacing_factor,
         selected_circular_spacing_factor=None,
-        circular_spacing_candidates=candidate_records,
-        circular_spacing_selection_reason=_circular_spacing_selection_reason(candidate_records),
-    )
-
-
-def _select_circular_spacing_candidate(
-    candidates: list[tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]],
-) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
-    target_candidates = [
-        candidate for candidate in candidates if candidate[3].covered_percent >= TARGET_COVERAGE_PERCENT
-    ]
-    search_pool = target_candidates if target_candidates else candidates
-    selected = search_pool[0]
-    for candidate in search_pool[1:]:
-        selected = _choose_better_strategy_candidate(selected, candidate, using_target_pool=bool(target_candidates))
-    return selected
-
-
-def _choose_better_strategy_candidate(
-    current: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
-    candidate: tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float],
-    *,
-    using_target_pool: bool,
-) -> tuple[int, float | None, OuterEdgeSweepMission, CoverageEstimate, float]:
-    current_rows, current_factor, current_mission, current_coverage, current_travel = current
-    candidate_rows, candidate_factor, candidate_mission, candidate_coverage, candidate_travel = candidate
-
-    if not using_target_pool:
-        coverage_delta = candidate_coverage.covered_percent - current_coverage.covered_percent
-        if coverage_delta > 0.5:
-            return candidate
-        if coverage_delta < -0.5:
-            return current
-
-    coverage_gain = candidate_coverage.covered_percent - current_coverage.covered_percent
-    scan_savings = len(current_mission.poses) - len(candidate_mission.poses)
-    if coverage_gain > 0.5 and scan_savings > 0:
-        return candidate
-    if coverage_gain < -0.5 and scan_savings < 0:
-        return current
-
-    candidate_key = (
-        candidate_travel,
-        len(candidate_mission.poses),
-        candidate_rows,
-        -(candidate_factor if candidate_factor is not None else 1.0),
-    )
-    current_key = (
-        current_travel,
-        len(current_mission.poses),
-        current_rows,
-        -(current_factor if current_factor is not None else 1.0),
-    )
-    return candidate if candidate_key < current_key else current
-
-
-def _circular_spacing_selection_reason(candidates: list[CircularSpacingCandidate]) -> str | None:
-    selected = next((candidate for candidate in candidates if candidate.selected), None)
-    if selected is None:
-        return None
-    if selected.coverage_percent >= TARGET_COVERAGE_PERCENT:
-        return (
-            f"reached {TARGET_COVERAGE_PERCENT:.0f}% coverage; chose the simpler qualifying row strategy"
-        )
-    return (
-        f"target {TARGET_COVERAGE_PERCENT:.0f}% was not reached; selected the best available row coverage"
+        circular_spacing_candidates=[candidate_record],
+        circular_spacing_selection_reason=(
+            f"geometry supports {row_count} usable circular row"
+            f"{'s' if row_count != 1 else ''} (preferred maximum {DEFAULT_MAX_CIRCULAR_ROWS})"
+        ),
     )
 
 
@@ -1036,55 +1238,1691 @@ def detect_vertical_plate_columns(
     model: GeometryModel,
     tank: TankCircleEstimate | None = None,
 ) -> list[VerticalPlateColumn]:
-    """Detect regular plate columns between long near-vertical DXF weld lines."""
+    """Compatibility wrapper for the existing vertical-column representation."""
+    sections, _invalid_count = detect_interior_sections(model, "vertical", tank)
+    return [
+        VerticalPlateColumn(
+            column_id=section.section_id,
+            center_x_m=section.center_cross_m,
+            left_weld_x_m=section.lower_weld_coordinate_m,
+            right_weld_x_m=section.upper_weld_coordinate_m,
+            min_y_m=section.progress_min_m,
+            max_y_m=section.progress_max_m,
+        )
+        for section in sections
+    ]
+
+
+def detect_horizontal_plate_rows(
+    model: GeometryModel,
+    tank: TankCircleEstimate | None = None,
+) -> tuple[list[InteriorSection], int]:
+    """Detect horizontal plate sections between long near-horizontal weld runs."""
+    return detect_interior_sections(model, "horizontal", tank)
+
+
+def detect_interior_sections(
+    model: GeometryModel,
+    orientation: str,
+    tank: TankCircleEstimate | None = None,
+) -> tuple[list[InteriorSection], int]:
+    """Detect plate sections between adjacent structural welds along either principal axis."""
+    if orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Interior section orientation must be 'vertical' or 'horizontal'.")
     tank = estimate_tank_circle_from_geometry(model) if tank is None else tank
-    grouped_segments = _group_vertical_segments(_iter_geometry_segments(model))
-    qualifying_lines: list[tuple[float, float, float]] = []
+    grouped_segments = _group_axis_segments(_iter_geometry_segments(model), orientation)
+    qualifying_lines: list[tuple[float, float, float, int]] = []
+    invalid_count = 0
 
-    for x_m, intervals in grouped_segments:
-        merged = _merge_intervals(intervals)
-        union_length = sum(end - start for start, end in merged)
-        radial_x = x_m - tank.center_x
-        chord_height = 2.0 * math.sqrt(max(0.0, tank.radius**2 - radial_x**2))
-        if chord_height <= 1e-9:
+    for cross_m, intervals, source_count in grouped_segments:
+        merge_tolerance = HORIZONTAL_FRAGMENT_MERGE_GAP_M if orientation == "horizontal" else 1e-6
+        merged = _merge_intervals(intervals, tolerance=merge_tolerance)
+        center_cross = tank.center_x if orientation == "vertical" else tank.center_y
+        radial_offset = cross_m - center_cross
+        chord_length = 2.0 * math.sqrt(max(0.0, tank.radius**2 - radial_offset**2))
+        if chord_length <= 1e-9 or not merged:
+            invalid_count += max(1, source_count)
             continue
-        if union_length / chord_height < VERTICAL_LINE_COVERAGE_RATIO:
-            continue
-        qualifying_lines.append(
-            (
-                x_m,
-                min(start for start, _end in merged),
-                max(end for _start, end in merged),
+
+        if orientation == "vertical":
+            union_length = sum(end - start for start, end in merged)
+            if union_length / chord_length < VERTICAL_LINE_COVERAGE_RATIO:
+                invalid_count += source_count
+                continue
+            qualifying_lines.append(
+                (
+                    cross_m,
+                    min(start for start, _end in merged),
+                    max(end for _start, end in merged),
+                    source_count,
+                )
             )
-        )
+            continue
 
-    qualifying_lines.sort(key=lambda item: item[0])
+        for start, end in merged:
+            if (end - start) / chord_length < VERTICAL_LINE_COVERAGE_RATIO:
+                invalid_count += 1
+                continue
+            qualifying_lines.append((cross_m, start, end, source_count))
+
+    qualifying_lines.sort(key=lambda item: (item[0], item[1], item[2]))
     if len(qualifying_lines) < 2:
-        return []
+        return [], invalid_count
 
-    gaps = np.diff([line[0] for line in qualifying_lines])
-    typical_gap = float(np.median(gaps))
+    unique_cross_values = sorted({line[0] for line in qualifying_lines})
+    positive_gaps = np.diff(unique_cross_values)
+    positive_gaps = positive_gaps[positive_gaps > 1e-9]
+    if len(positive_gaps) == 0:
+        return [], invalid_count + len(qualifying_lines)
+    typical_gap = float(np.median(positive_gaps))
     max_regular_gap = typical_gap * 1.5
-    columns: list[VerticalPlateColumn] = []
-    for left, right in zip(qualifying_lines, qualifying_lines[1:]):
-        gap = right[0] - left[0]
-        if gap <= 1e-9 or gap > max_regular_gap:
+    sections: list[InteriorSection] = []
+
+    for lower_index, lower in enumerate(qualifying_lines):
+        for upper in qualifying_lines[lower_index + 1 :]:
+            gap = upper[0] - lower[0]
+            if gap <= 1e-9:
+                continue
+            if gap > max_regular_gap:
+                break
+            if any(lower[0] < other_cross < upper[0] for other_cross in unique_cross_values):
+                continue
+            progress_min = max(lower[1], upper[1])
+            progress_max = min(lower[2], upper[2])
+            if progress_max <= progress_min:
+                invalid_count += 1
+                continue
+            section_id = len(sections)
+            sections.append(
+                InteriorSection(
+                    section_id=section_id,
+                    group_id=section_id,
+                    orientation=orientation,
+                    center_cross_m=(lower[0] + upper[0]) / 2.0,
+                    lower_weld_coordinate_m=lower[0],
+                    upper_weld_coordinate_m=upper[0],
+                    progress_min_m=progress_min,
+                    progress_max_m=progress_max,
+                    source_segment_count=lower[3] + upper[3],
+                )
+            )
+    return sections, invalid_count
+
+
+def generate_lawnmower_section_lines(
+    model: GeometryModel,
+    tank: TankCircleEstimate | None = None,
+) -> list[LawnmowerSectionLine]:
+    """Return direction-neutral vertical and horizontal centerlines without poses or paths."""
+    tank = estimate_tank_circle_from_geometry(model) if tank is None else tank
+    vertical_specs = _vertical_lawnmower_section_specs(model, tank)
+    horizontal_specs = _horizontal_lawnmower_section_specs(model, tank, vertical_specs)
+
+    lines: list[LawnmowerSectionLine] = []
+    vertical_order_index = 0
+    for center_x_m, min_y_m, max_y_m, source_section_id in vertical_specs:
+        clipped = _clip_axis_section_to_tank(
+            "vertical",
+            center_x_m,
+            min_y_m,
+            max_y_m,
+            tank,
+        )
+        if clipped is None:
             continue
-        min_y = max(left[1], right[1])
-        max_y = min(left[2], right[2])
-        if max_y <= min_y:
-            continue
-        columns.append(
-            VerticalPlateColumn(
-                column_id=len(columns),
-                center_x_m=(left[0] + right[0]) / 2.0,
-                left_weld_x_m=left[0],
-                right_weld_x_m=right[0],
-                min_y_m=min_y,
-                max_y_m=max_y,
+        order_index = vertical_order_index
+        vertical_order_index += 1
+        lower, upper = clipped
+        start = (center_x_m, lower)
+        end = (center_x_m, upper)
+        lines.append(
+            LawnmowerSectionLine(
+                line_id=len(lines),
+                orientation="vertical",
+                order_index=order_index,
+                source_section_id=source_section_id,
+                start_m=start,
+                end_m=end,
             )
         )
-    return columns
+
+    horizontal_order_index = 0
+    for center_y_m, min_x_m, max_x_m, source_section_id in horizontal_specs:
+        clipped = _clip_axis_section_to_tank(
+            "horizontal",
+            center_y_m,
+            min_x_m,
+            max_x_m,
+            tank,
+        )
+        if clipped is None:
+            continue
+        order_index = horizontal_order_index
+        horizontal_order_index += 1
+        lower, upper = clipped
+        start = (lower, center_y_m)
+        end = (upper, center_y_m)
+        lines.append(
+            LawnmowerSectionLine(
+                line_id=len(lines),
+                orientation="horizontal",
+                order_index=order_index,
+                source_section_id=source_section_id,
+                start_m=start,
+                end_m=end,
+            )
+        )
+    # The normal planner uses only guide sections derived from the detected
+    # weld geometry.  The experimental outer extensions remain diagnostic-only
+    # and must not participate in normal mission generation.
+    return lines
+
+
+def generate_lawnmower_scan_placements(
+    lines: list[LawnmowerSectionLine],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+    target_overlap_fraction: float = DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+) -> list[LawnmowerScanPlacement]:
+    """Place full rainbow profiles along existing guide lines.
+
+    Each placement is translated from the midpoint of the rainbow's outer
+    1.600 m chord.  The chord remains perpendicular to the ordered guide
+    line while the profile's local positive-y direction follows travel.
+
+    This helper supports the profile-only diagnostic CLI. Mission planning
+    uses :func:`gate_lawnmower_candidates`, the single authoritative coverage
+    gate.
+    """
+    if not 0.0 < target_overlap_fraction < 1.0:
+        raise ValueError("Lawnmower neighbor overlap fraction must be between 0 and 1.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    local_profile = make_rainbow_profile(profile_config)
+    long_side_start, long_side_end = _rainbow_long_side_endpoints(local_profile)
+    local_anchor = (long_side_start + long_side_end) / 2.0
+    target_step = _lawnmower_spacing_for_overlap(local_profile, target_overlap_fraction)
+
+    placements: list[LawnmowerScanPlacement] = []
+    for line in lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length <= SECTION_MIN_LENGTH_M:
+            continue
+        direction = delta / length
+        heading_rad = _normalize_angle(math.atan2(direction[1], direction[0]) - math.pi / 2.0)
+        canonical_start, canonical_direction = _canonical_lawnmower_line_reference(start, end)
+        anchor_distances = _lawnmower_anchor_distances(
+            length,
+            local_profile,
+            local_anchor,
+            target_step,
+        )
+        anchor_points = [canonical_start + canonical_direction * distance_m for distance_m in anchor_distances]
+        if float(np.dot(direction, canonical_direction)) < 0.0:
+            anchor_points.reverse()
+        travel_direction = _line_travel_direction(direction)
+        rotation = np.array(
+            [
+                [math.cos(heading_rad), -math.sin(heading_rad)],
+                [math.sin(heading_rad), math.cos(heading_rad)],
+            ],
+            dtype=float,
+        )
+        for placement_index, anchor in enumerate(anchor_points):
+            profile_origin = anchor - local_anchor @ rotation.T
+            candidate = LawnmowerScanPlacement(
+                placement_id=len(placements),
+                guide_line_id=line.line_id,
+                guide_order_index=line.order_index,
+                placement_index=placement_index,
+                orientation=line.orientation,
+                travel_direction=travel_direction,
+                anchor_m=(float(anchor[0]), float(anchor[1])),
+                profile_origin_m=(float(profile_origin[0]), float(profile_origin[1])),
+                heading_rad=heading_rad,
+                heading_deg=math.degrees(heading_rad),
+            )
+            if _is_effectively_duplicate_lawnmower_placement(candidate, placements):
+                continue
+            placements.append(candidate)
+    return placements
+
+
+def _lawnmower_line_cross_coordinate(line: LawnmowerSectionLine) -> float:
+    return float(line.start_m[0] if line.orientation == "vertical" else line.start_m[1])
+
+
+def _lawnmower_line_progress_interval(
+    line: LawnmowerSectionLine,
+) -> tuple[float, float]:
+    coordinates = (
+        (line.start_m[1], line.end_m[1])
+        if line.orientation == "vertical"
+        else (line.start_m[0], line.end_m[0])
+    )
+    return float(min(coordinates)), float(max(coordinates))
+
+
+def detect_lawnmower_guide_symmetry(
+    lines: list[LawnmowerSectionLine],
+    tank: TankCircleEstimate,
+    *,
+    tolerance_m: float = LAWN_SYMMETRY_POSITION_TOLERANCE_M,
+) -> LawnmowerSymmetryPlan:
+    """Pair guide geometry only when its reflection about the tank center exists."""
+    pairs: list[LawnmowerGuidePair] = []
+    symmetric_orientations: list[str] = []
+    duplicate_line_ids: list[int] = []
+    unique_by_orientation: dict[str, list[LawnmowerSectionLine]] = {}
+
+    for orientation in ("vertical", "horizontal"):
+        orientation_lines = sorted(
+            (line for line in lines if line.orientation == orientation),
+            key=lambda line: (
+                _lawnmower_line_cross_coordinate(line),
+                *_lawnmower_line_progress_interval(line),
+                line.line_id,
+            ),
+        )
+        unique_lines: list[LawnmowerSectionLine] = []
+        for line in orientation_lines:
+            cross_m = _lawnmower_line_cross_coordinate(line)
+            progress_min, progress_max = _lawnmower_line_progress_interval(line)
+            duplicate = next(
+                (
+                    existing
+                    for existing in unique_lines
+                    if abs(_lawnmower_line_cross_coordinate(existing) - cross_m) <= tolerance_m
+                    and abs(_lawnmower_line_progress_interval(existing)[0] - progress_min) <= tolerance_m
+                    and abs(_lawnmower_line_progress_interval(existing)[1] - progress_max) <= tolerance_m
+                ),
+                None,
+            )
+            if duplicate is not None:
+                duplicate_line_ids.append(line.line_id)
+            else:
+                unique_lines.append(line)
+        unique_by_orientation[orientation] = unique_lines
+
+        if not unique_lines:
+            symmetric_orientations.append(orientation)
+            continue
+
+        center_cross = tank.center_x if orientation == "vertical" else tank.center_y
+        remaining = {line.line_id: line for line in unique_lines}
+        provisional: list[tuple[LawnmowerSectionLine, LawnmowerSectionLine | None, float]] = []
+        symmetric = True
+        for line in unique_lines:
+            if line.line_id not in remaining:
+                continue
+            cross_m = _lawnmower_line_cross_coordinate(line)
+            progress_min, progress_max = _lawnmower_line_progress_interval(line)
+            if abs(cross_m - center_cross) <= tolerance_m:
+                provisional.append((line, None, abs(cross_m - center_cross)))
+                del remaining[line.line_id]
+                continue
+            target_cross = 2.0 * center_cross - cross_m
+            candidates: list[tuple[float, LawnmowerSectionLine]] = []
+            for other in remaining.values():
+                if other.line_id == line.line_id:
+                    continue
+                other_min, other_max = _lawnmower_line_progress_interval(other)
+                cross_error = abs(_lawnmower_line_cross_coordinate(other) - target_cross)
+                interval_error = max(
+                    abs(other_min - progress_min),
+                    abs(other_max - progress_max),
+                )
+                if cross_error <= tolerance_m and interval_error <= tolerance_m:
+                    candidates.append((cross_error + interval_error, other))
+            if not candidates:
+                symmetric = False
+                break
+            _error, other = min(candidates, key=lambda item: (item[0], item[1].line_id))
+            first, second = sorted(
+                (line, other),
+                key=lambda item: (
+                    _lawnmower_line_cross_coordinate(item),
+                    item.line_id,
+                ),
+            )
+            mirror_error = abs(
+                _lawnmower_line_cross_coordinate(first)
+                + _lawnmower_line_cross_coordinate(second)
+                - 2.0 * center_cross
+            )
+            provisional.append((first, second, mirror_error))
+            del remaining[line.line_id]
+            del remaining[other.line_id]
+
+        if symmetric and not remaining:
+            symmetric_orientations.append(orientation)
+            provisional.sort(
+                key=lambda item: (
+                    _lawnmower_line_cross_coordinate(item[0]),
+                    _lawnmower_line_progress_interval(item[0]),
+                )
+            )
+            for pair_index, (first, second, mirror_error) in enumerate(provisional):
+                intervals = [_lawnmower_line_progress_interval(first)]
+                if second is not None:
+                    intervals.append(_lawnmower_line_progress_interval(second))
+                shared_interval = (
+                    max(interval[0] for interval in intervals),
+                    min(interval[1] for interval in intervals),
+                )
+                pairs.append(
+                    LawnmowerGuidePair(
+                        pair_id=f"{orientation}_pair_{pair_index}",
+                        orientation=orientation,
+                        left_line_id=first.line_id,
+                        right_line_id=None if second is None else second.line_id,
+                        cross_mirror_error_m=mirror_error,
+                        longitudinal_interval_m=shared_interval,
+                    )
+                )
+        else:
+            for line in orientation_lines:
+                interval = _lawnmower_line_progress_interval(line)
+                pairs.append(
+                    LawnmowerGuidePair(
+                        pair_id=f"{orientation}_single_{line.line_id}",
+                        orientation=orientation,
+                        left_line_id=line.line_id,
+                        right_line_id=None,
+                        cross_mirror_error_m=math.inf,
+                        longitudinal_interval_m=interval,
+                    )
+                )
+
+    # The real four-column/no-row geometry uses one longitudinal lattice for
+    # all four guides. This is detected from the guide geometry itself.
+    common_four_interval: tuple[float, float] | None = None
+    vertical_unique = unique_by_orientation.get("vertical", [])
+    horizontal_unique = unique_by_orientation.get("horizontal", [])
+    if (
+        len(vertical_unique) == 4
+        and not horizontal_unique
+        and "vertical" in symmetric_orientations
+        and not any(line.is_outer_extension for line in vertical_unique)
+    ):
+        cross_values = np.asarray(
+            sorted(_lawnmower_line_cross_coordinate(line) for line in vertical_unique),
+            dtype=float,
+        )
+        spacings = np.diff(cross_values)
+        if len(spacings) == 3 and bool(
+            np.all(
+                np.abs(spacings - float(np.median(spacings)))
+                <= tolerance_m
+            )
+        ):
+            intervals = [
+                _lawnmower_line_progress_interval(line)
+                for line in vertical_unique
+            ]
+            candidate_interval = (
+                max(interval[0] for interval in intervals),
+                min(interval[1] for interval in intervals),
+            )
+            if candidate_interval[1] - candidate_interval[0] > SECTION_MIN_LENGTH_M:
+                common_four_interval = candidate_interval
+
+    # Duplicate guides are intentionally excluded from mirror pairing. They
+    # remain independent so the normal guide rollback rejects their redundancy.
+    paired_ids = {
+        line_id
+        for pair in pairs
+        for line_id in (pair.left_line_id, pair.right_line_id)
+        if line_id is not None
+    }
+    lines_by_id = {line.line_id: line for line in lines}
+    for line_id in sorted(set(duplicate_line_ids) - paired_ids):
+        line = lines_by_id[line_id]
+        pairs.append(
+            LawnmowerGuidePair(
+                pair_id=f"{line.orientation}_duplicate_{line_id}",
+                orientation=line.orientation,
+                left_line_id=line_id,
+                right_line_id=None,
+                cross_mirror_error_m=math.inf,
+                longitudinal_interval_m=_lawnmower_line_progress_interval(line),
+            )
+        )
+
+    pairs.sort(
+        key=lambda pair: (
+            0 if pair.orientation == "vertical" else 1,
+            _lawnmower_line_cross_coordinate(lines_by_id[pair.left_line_id]),
+            _lawnmower_line_progress_interval(lines_by_id[pair.left_line_id]),
+            1 if "_duplicate_" in pair.pair_id else 0,
+            pair.pair_id,
+        )
+    )
+    return LawnmowerSymmetryPlan(
+        pairs=tuple(pairs),
+        symmetric_orientations=tuple(symmetric_orientations),
+        duplicate_line_ids=tuple(sorted(set(duplicate_line_ids))),
+        common_four_vertical_interval_m=common_four_interval,
+    )
+
+
+def _generate_lawnmower_candidate_lattice(
+    lines: list[LawnmowerSectionLine],
+    *,
+    tank: TankCircleEstimate | None = None,
+    profile_config: RainbowProfileConfig | None = None,
+    target_overlap_fraction: float = DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+) -> list[LawnmowerCandidateRecord]:
+    """Generate every unchanged normal-lattice candidate without gating it."""
+    if not 0.0 < target_overlap_fraction < 1.0:
+        raise ValueError("Lawnmower neighbor overlap fraction must be between 0 and 1.")
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    halves = make_rainbow_profile_halves(profile_config)
+    local_profile = halves.full_polygon
+    local_anchor = np.asarray(halves.long_side_anchor_m, dtype=float)
+    target_step = _lawnmower_spacing_for_overlap(local_profile, target_overlap_fraction)
+    ordered_lines = sorted(
+        lines,
+        key=lambda line: (
+            0 if line.orientation == "vertical" else 1,
+            line.order_index,
+            line.line_id,
+        ),
+    )
+    symmetry_plan = (
+        detect_lawnmower_guide_symmetry(lines, tank)
+        if tank is not None
+        else None
+    )
+    pair_by_line: dict[int, LawnmowerGuidePair] = {}
+    shared_progress_by_line: dict[int, np.ndarray] = {}
+    if symmetry_plan is not None:
+        for pair in symmetry_plan.pairs:
+            interval = pair.longitudinal_interval_m
+            if (
+                pair.orientation == "vertical"
+                and symmetry_plan.common_four_vertical_interval_m is not None
+            ):
+                interval = symmetry_plan.common_four_vertical_interval_m
+            interval_length = interval[1] - interval[0]
+            if interval_length <= SECTION_MIN_LENGTH_M:
+                continue
+            distances = _lawnmower_anchor_distances(
+                interval_length,
+                local_profile,
+                local_anchor,
+                target_step,
+            )
+            progress_values = interval[0] + distances
+            for line_id in (pair.left_line_id, pair.right_line_id):
+                if line_id is None:
+                    continue
+                pair_by_line[line_id] = pair
+                if pair.right_line_id is not None or (
+                    pair.orientation == "vertical"
+                    and symmetry_plan.common_four_vertical_interval_m is not None
+                ):
+                    shared_progress_by_line[line_id] = progress_values
+
+    records: list[LawnmowerCandidateRecord] = []
+    for line in ordered_lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        delta = end - start
+        length = float(np.linalg.norm(delta))
+        if length <= SECTION_MIN_LENGTH_M:
+            continue
+        direction = delta / length
+        heading_rad = _normalize_angle(math.atan2(direction[1], direction[0]) - math.pi / 2.0)
+        canonical_start, canonical_direction = _canonical_lawnmower_line_reference(start, end)
+        shared_progress = shared_progress_by_line.get(line.line_id)
+        if shared_progress is None:
+            anchor_distances = _lawnmower_anchor_distances(
+                length,
+                local_profile,
+                local_anchor,
+                target_step,
+            )
+            anchor_points = [
+                canonical_start + canonical_direction * distance_m
+                for distance_m in anchor_distances
+            ]
+        elif line.orientation == "vertical":
+            anchor_points = [
+                np.asarray(
+                    (_lawnmower_line_cross_coordinate(line), progress_m),
+                    dtype=float,
+                )
+                for progress_m in shared_progress
+            ]
+        else:
+            anchor_points = [
+                np.asarray(
+                    (progress_m, _lawnmower_line_cross_coordinate(line)),
+                    dtype=float,
+                )
+                for progress_m in shared_progress
+            ]
+        if float(np.dot(direction, canonical_direction)) < 0.0:
+            anchor_points.reverse()
+        travel_direction = _line_travel_direction(direction)
+        rotation = np.array(
+            [
+                [math.cos(heading_rad), -math.sin(heading_rad)],
+                [math.sin(heading_rad), math.cos(heading_rad)],
+            ],
+            dtype=float,
+        )
+        for placement_index, anchor in enumerate(anchor_points):
+            profile_origin = anchor - local_anchor @ rotation.T
+            x_m = float(profile_origin[0])
+            y_m = float(profile_origin[1])
+            records.append(
+                LawnmowerCandidateRecord(
+                    candidate_id=len(records),
+                    guide_line_id=line.line_id,
+                    guide_order_index=line.order_index,
+                    placement_index=placement_index,
+                    orientation=line.orientation,
+                    travel_direction=travel_direction,
+                    projected_position_m=float(np.dot(anchor - start, direction)),
+                    anchor_m=(float(anchor[0]), float(anchor[1])),
+                    profile_origin_m=(x_m, y_m),
+                    heading_rad=heading_rad,
+                    heading_deg=math.degrees(heading_rad),
+                    full_polygon=transform_profile(local_profile, x_m, y_m, heading_rad),
+                    left_half_polygon=transform_rainbow_half(
+                        halves.left_half,
+                        x_m,
+                        y_m,
+                        heading_rad,
+                    ),
+                    right_half_polygon=transform_rainbow_half(
+                        halves.right_half,
+                        x_m,
+                        y_m,
+                        heading_rad,
+                    ),
+                    candidate_source="normal_lattice",
+                    candidate_stage=(
+                        "interior_vertical"
+                        if line.orientation == "vertical"
+                        else "interior_horizontal"
+                    ),
+                    symmetry_pair_id=(
+                        pair_by_line[line.line_id].pair_id
+                        if line.line_id in pair_by_line
+                        else None
+                    ),
+                )
+            )
+    return records
+
+
+def _exact_lawnmower_candidate_metrics(
+    candidate_polygon: np.ndarray,
+    valid_region: BaseGeometry,
+    existing_coverage: BaseGeometry,
+    immediate_neighbor: AcceptedLawnmowerCoverage | None,
+) -> LawnmowerCandidateMetrics:
+    candidate = as_polygon(candidate_polygon)
+    total_area = float(candidate.area)
+    if total_area <= GEOMETRY_EPSILON:
+        return LawnmowerCandidateMetrics(
+            total_area_m2=total_area,
+            inside_area_m2=0.0,
+            outside_area_m2=0.0,
+            inside_fraction=0.0,
+            outside_fraction=0.0,
+            total_overlap_area_m2=0.0,
+            expected_neighbor_overlap_area_m2=0.0,
+            harmful_overlap_area_m2=0.0,
+            harmful_overlap_fraction=0.0,
+            new_area_m2=0.0,
+            new_fraction=0.0,
+        )
+    inside_polygon = candidate.intersection(valid_region)
+    outside_polygon = candidate.difference(valid_region)
+    total_overlap_polygon = inside_polygon.intersection(existing_coverage)
+    new_polygon = inside_polygon.difference(existing_coverage)
+    inside_area = float(inside_polygon.area)
+    outside_area = float(outside_polygon.area)
+    total_overlap_area = float(total_overlap_polygon.area)
+    new_area = float(new_polygon.area)
+    allowed_neighbor_overlap = 0.0
+    if immediate_neighbor is not None:
+        actual_neighbor_overlap = float(
+            inside_polygon.intersection(as_polygon(immediate_neighbor.polygon)).area
+        )
+        allowed_neighbor_overlap = min(
+            actual_neighbor_overlap,
+            MAX_EXPECTED_NEIGHBOR_OVERLAP_FRACTION
+            * min(inside_area, immediate_neighbor.inside_area_m2),
+        )
+    harmful_overlap_area = max(0.0, total_overlap_area - allowed_neighbor_overlap)
+    return LawnmowerCandidateMetrics(
+        total_area_m2=total_area,
+        inside_area_m2=inside_area,
+        outside_area_m2=outside_area,
+        inside_fraction=inside_area / max(total_area, GEOMETRY_EPSILON),
+        outside_fraction=outside_area / max(total_area, GEOMETRY_EPSILON),
+        total_overlap_area_m2=total_overlap_area,
+        expected_neighbor_overlap_area_m2=allowed_neighbor_overlap,
+        harmful_overlap_area_m2=harmful_overlap_area,
+        harmful_overlap_fraction=harmful_overlap_area / max(inside_area, GEOMETRY_EPSILON),
+        new_area_m2=new_area,
+        new_fraction=new_area / max(inside_area, GEOMETRY_EPSILON),
+    )
+
+
+def _new_coverage_fraction(metrics: LawnmowerCandidateMetrics) -> float:
+    """Return uncovered usable area as a fraction of the profile's own area."""
+    return metrics.new_area_m2 / max(metrics.total_area_m2, GEOMETRY_EPSILON)
+
+
+def _simple_profile_safety_reason(
+    candidate: LawnmowerCandidateRecord,
+    polygon: np.ndarray,
+    metrics: LawnmowerCandidateMetrics,
+    accepted_placements: list[LawnmowerScanPlacement],
+    *,
+    minimum_inside_fraction: float,
+    maximum_outside_fraction: float,
+) -> str | None:
+    """Keep the existing geometry, boundary, and duplicate safeguards only."""
+    geometry = as_polygon(polygon)
+    if (
+        not math.isfinite(candidate.heading_rad)
+        or not bool(np.all(np.isfinite(polygon)))
+        or geometry.is_empty
+        or not geometry.is_valid
+        or metrics.total_area_m2 <= GEOMETRY_EPSILON
+    ):
+        return "rejected_invalid_geometry"
+    if (
+        metrics.inside_area_m2 <= GEOMETRY_EPSILON
+        or metrics.inside_fraction < minimum_inside_fraction
+        or metrics.outside_fraction > maximum_outside_fraction
+    ):
+        return "rejected_boundary"
+    hypothetical = _placement_from_lawnmower_candidate(
+        candidate,
+        profile_variant="full",
+        placement_id=-1,
+    )
+    if _is_effectively_duplicate_lawnmower_placement(
+        hypothetical,
+        accepted_placements,
+    ):
+        return "rejected_duplicate"
+    return None
+
+
+def _select_simple_new_coverage_variant(
+    full_metrics: LawnmowerCandidateMetrics,
+    left_metrics: LawnmowerCandidateMetrics,
+    right_metrics: LawnmowerCandidateMetrics,
+    *,
+    full_safety_reason: str | None,
+    left_safety_reason: str | None,
+    right_safety_reason: str | None,
+) -> tuple[str | None, str]:
+    """Apply the one 40%-new-coverage full/half selection rule."""
+    if (
+        full_safety_reason is None
+        and _new_coverage_fraction(full_metrics) >= MIN_NEW_COVERAGE_FRACTION
+    ):
+        return "full", "accepted_full_new_coverage"
+
+    # Invalid or duplicate parent poses cannot be salvaged by selecting one of
+    # their halves. Boundary failures may be one-sided, so each half still gets
+    # its own existing boundary check below.
+    if full_safety_reason in {"rejected_invalid_geometry", "rejected_duplicate"}:
+        return None, full_safety_reason
+
+    passing_halves = [
+        ("left_half", left_metrics),
+        ("right_half", right_metrics),
+    ]
+    passing_halves = [
+        (variant, metrics)
+        for variant, metrics in passing_halves
+        if (
+            (left_safety_reason if variant == "left_half" else right_safety_reason)
+            is None
+            and _new_coverage_fraction(metrics) >= MIN_NEW_COVERAGE_FRACTION
+        )
+    ]
+    if len(passing_halves) == 1:
+        variant, _metrics = passing_halves[0]
+        return variant, f"accepted_{variant}_new_coverage"
+    if len(passing_halves) == 2:
+        left_metrics_passing = passing_halves[0][1]
+        right_metrics_passing = passing_halves[1][1]
+        # The left-half entry is deliberately first: it is the deterministic
+        # tie-break when the two areas are equal within geometry tolerance.
+        if (
+            right_metrics_passing.new_area_m2
+            > left_metrics_passing.new_area_m2 + GEOMETRY_EPSILON
+        ):
+            return "right_half", "accepted_right_half_new_coverage"
+        return "left_half", "accepted_left_half_new_coverage"
+
+    if full_safety_reason == "rejected_boundary" and (
+        left_safety_reason == "rejected_boundary"
+        or right_safety_reason == "rejected_boundary"
+    ):
+        return None, "rejected_boundary"
+    return None, "rejected_below_new_coverage_threshold"
+
+
+def _placement_from_lawnmower_candidate(
+    candidate: LawnmowerCandidateRecord,
+    *,
+    profile_variant: str,
+    placement_id: int,
+) -> LawnmowerScanPlacement:
+    return LawnmowerScanPlacement(
+        placement_id=placement_id,
+        guide_line_id=candidate.guide_line_id,
+        guide_order_index=candidate.guide_order_index,
+        placement_index=candidate.placement_index,
+        orientation=candidate.orientation,
+        travel_direction=candidate.travel_direction,
+        anchor_m=candidate.anchor_m,
+        profile_origin_m=candidate.profile_origin_m,
+        heading_rad=candidate.heading_rad,
+        heading_deg=candidate.heading_deg,
+        profile_variant=profile_variant,
+        parent_profile_origin_m=(
+            candidate.profile_origin_m if profile_variant != "full" else None
+        ),
+    )
+
+
+def gate_lawnmower_candidates(
+    lines: list[LawnmowerSectionLine],
+    tank: TankCircleEstimate,
+    edge_poses: list[SweepPose],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> LawnmowerGatingPass:
+    """Apply the single authoritative full/half exact-geometry gate."""
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    halves = make_rainbow_profile_halves(profile_config)
+    local_profile = halves.full_polygon
+    local_anchor = np.asarray(halves.long_side_anchor_m, dtype=float)
+    target_step = _lawnmower_spacing_for_overlap(
+        local_profile,
+        DEFAULT_LAWNMOWER_NEIGHBOR_OVERLAP_FRACTION,
+    )
+    candidates = _generate_lawnmower_candidate_lattice(
+        lines,
+        tank=tank,
+        profile_config=profile_config,
+    )
+    candidates_by_guide: dict[int, list[LawnmowerCandidateRecord]] = {}
+    for candidate in candidates:
+        candidates_by_guide.setdefault(candidate.guide_line_id, []).append(candidate)
+
+    circular_polygons = [
+        polygon
+        for polygon, _bounds in _circular_edge_polygon_records(local_profile, edge_poses)
+    ]
+    coverage = polygon_union(circular_polygons)
+    accepted_placements: list[LawnmowerScanPlacement] = []
+    evaluated_candidates: list[LawnmowerCandidateRecord] = []
+    retained_guide_ids: list[int] = []
+    discarded_guide_ids: list[int] = []
+    symmetry_plan = detect_lawnmower_guide_symmetry(lines, tank)
+    lines_by_id = {line.line_id: line for line in lines}
+    guide_pair_ids = {
+        line_id: pair.pair_id
+        for pair in symmetry_plan.pairs
+        for line_id in (pair.left_line_id, pair.right_line_id)
+        if line_id is not None
+    }
+
+    def evaluate_guide(
+        line: LawnmowerSectionLine,
+        coverage_before_guide: BaseGeometry,
+    ) -> tuple[
+        list[LawnmowerScanPlacement],
+        list[np.ndarray],
+        list[LawnmowerCandidateRecord],
+        bool,
+    ]:
+        local_coverage = coverage_before_guide
+        guide_placements: list[LawnmowerScanPlacement] = []
+        guide_polygons: list[np.ndarray] = []
+        guide_candidates: list[LawnmowerCandidateRecord] = []
+        immediate_neighbor: AcceptedLawnmowerCoverage | None = None
+        valid_region = build_candidate_valid_region(
+            line.start_m,
+            line.end_m,
+            (tank.center_x, tank.center_y),
+            tank.radius,
+            local_profile,
+            local_anchor,
+            target_step,
+        )
+        for candidate in candidates_by_guide.get(line.line_id, []):
+            full_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.full_polygon,
+                valid_region,
+                local_coverage,
+                immediate_neighbor,
+            )
+            left_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.left_half_polygon,
+                valid_region,
+                local_coverage,
+                immediate_neighbor,
+            )
+            right_metrics = _exact_lawnmower_candidate_metrics(
+                candidate.right_half_polygon,
+                valid_region,
+                local_coverage,
+                immediate_neighbor,
+            )
+            full_safety_reason = _simple_profile_safety_reason(
+                candidate,
+                candidate.full_polygon,
+                full_metrics,
+                accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_FULL_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_FULL_OUTSIDE_FRACTION,
+            )
+            left_safety_reason = _simple_profile_safety_reason(
+                candidate,
+                candidate.left_half_polygon,
+                left_metrics,
+                accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_HALF_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_HALF_OUTSIDE_FRACTION,
+            )
+            right_safety_reason = _simple_profile_safety_reason(
+                candidate,
+                candidate.right_half_polygon,
+                right_metrics,
+                accepted_placements + guide_placements,
+                minimum_inside_fraction=MIN_HALF_INSIDE_FRACTION,
+                maximum_outside_fraction=MAX_HALF_OUTSIDE_FRACTION,
+            )
+            selected_variant, result = _select_simple_new_coverage_variant(
+                full_metrics,
+                left_metrics,
+                right_metrics,
+                full_safety_reason=full_safety_reason,
+                left_safety_reason=left_safety_reason,
+                right_safety_reason=right_safety_reason,
+            )
+            reasons = () if selected_variant is not None else (result,)
+            LOGGER.debug(
+                "lawnmower candidate stage=%s guide_id=%s anchor=%s "
+                "full_new_area=%.9g full_total_area=%.9g full_new_fraction=%.9g "
+                "left_new_area=%.9g left_new_fraction=%.9g "
+                "right_new_area=%.9g right_new_fraction=%.9g "
+                "selected_variant=%s result=%s",
+                candidate.candidate_stage,
+                candidate.guide_line_id,
+                candidate.anchor_m,
+                full_metrics.new_area_m2,
+                full_metrics.total_area_m2,
+                _new_coverage_fraction(full_metrics),
+                left_metrics.new_area_m2,
+                _new_coverage_fraction(left_metrics),
+                right_metrics.new_area_m2,
+                _new_coverage_fraction(right_metrics),
+                selected_variant,
+                result,
+            )
+
+            evaluated = replace(
+                candidate,
+                acceptance_result=result,
+                rejection_reasons=reasons,
+                full_metrics=full_metrics,
+                left_half_metrics=left_metrics,
+                right_half_metrics=right_metrics,
+            )
+            guide_candidates.append(evaluated)
+            if selected_variant is None:
+                continue
+
+            placement = _placement_from_lawnmower_candidate(
+                candidate,
+                profile_variant=selected_variant,
+                placement_id=len(accepted_placements) + len(guide_placements),
+            )
+            selected_polygon = {
+                "full": candidate.full_polygon,
+                "left_half": candidate.left_half_polygon,
+                "right_half": candidate.right_half_polygon,
+            }[selected_variant]
+            selected_metrics = {
+                "full": full_metrics,
+                "left_half": left_metrics,
+                "right_half": right_metrics,
+            }[selected_variant]
+            guide_placements.append(placement)
+            guide_polygons.append(selected_polygon)
+            local_coverage = local_coverage.union(as_polygon(selected_polygon))
+            immediate_neighbor = AcceptedLawnmowerCoverage(
+                guide_line_id=line.line_id,
+                orientation=line.orientation,
+                projected_position_m=candidate.projected_position_m,
+                profile_variant=selected_variant,
+                polygon=selected_polygon,
+                inside_area_m2=selected_metrics.inside_area_m2,
+            )
+
+        # The 40% candidate decision is the only coverage gate.  A guide with
+        # accepted candidates is retained; there is no second guide rollback.
+        return guide_placements, guide_polygons, guide_candidates, bool(guide_placements)
+
+    for pair in symmetry_plan.pairs:
+        coverage_before_pair = coverage
+        pair_accepted: list[LawnmowerScanPlacement] = []
+        pair_polygons: list[np.ndarray] = []
+        pair_candidates: list[LawnmowerCandidateRecord] = []
+        for line_id in (pair.left_line_id, pair.right_line_id):
+            if line_id is None:
+                continue
+            line = lines_by_id[line_id]
+            (
+                guide_placements,
+                guide_polygons,
+                guide_candidates,
+                retain_guide,
+            ) = evaluate_guide(line, coverage_before_pair)
+            pair_candidates.extend(guide_candidates)
+            if retain_guide:
+                retained_guide_ids.append(line.line_id)
+                pair_accepted.extend(guide_placements)
+                pair_polygons.extend(guide_polygons)
+            else:
+                discarded_guide_ids.append(line.line_id)
+        evaluated_candidates.extend(pair_candidates)
+        accepted_placements.extend(pair_accepted)
+        if pair_polygons:
+            coverage = coverage_before_pair.union(polygon_union(pair_polygons))
+
+    accepted_placements = [
+        replace(placement, placement_id=index)
+        for index, placement in enumerate(
+            sorted(
+                accepted_placements,
+                key=lambda placement: (
+                    0 if placement.orientation == "vertical" else 1,
+                    placement.guide_order_index,
+                    placement.placement_index,
+                ),
+            )
+        )
+    ]
+    evaluated_candidates.sort(key=lambda candidate: candidate.candidate_id)
+    gating_pass = LawnmowerGatingPass(
+        placements=accepted_placements,
+        candidates=evaluated_candidates,
+        retained_guide_ids=retained_guide_ids,
+        discarded_guide_ids=discarded_guide_ids,
+        guide_pair_ids=guide_pair_ids,
+    )
+    return gating_pass
+
+
+def _lawnmower_placements_to_sweep_poses(
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    *,
+    scan_id_start: int,
+) -> list[SweepPose]:
+    """Convert approved anchored lawnmower placements into mission-compatible poses."""
+    lines_by_id = {line.line_id: line for line in lines}
+    ordered = sorted(
+        placements,
+        key=lambda placement: (
+            0 if placement.orientation == "vertical" else 1,
+            placement.guide_order_index,
+            placement.placement_index,
+        ),
+    )
+    poses: list[SweepPose] = []
+    for placement in ordered:
+        line = lines_by_id[placement.guide_line_id]
+        stage = "interior_vertical" if placement.orientation == "vertical" else "interior_horizontal"
+        poses.append(
+            SweepPose(
+                scan_id=scan_id_start + len(poses),
+                stage=stage,
+                x_m=placement.profile_origin_m[0],
+                y_m=placement.profile_origin_m[1],
+                heading_rad=placement.heading_rad,
+                heading_deg=placement.heading_deg,
+                row_id=placement.guide_line_id,
+                row_name=f"lawnmower_{placement.orientation}_guide",
+                column_id=line.source_section_id if placement.orientation == "vertical" else None,
+                orientation=placement.orientation,
+                group_id=placement.guide_order_index,
+                section_id=placement.guide_line_id,
+                travel_direction=placement.travel_direction,
+                profile_variant=placement.profile_variant,
+                anchor_x_m=placement.anchor_m[0],
+                anchor_y_m=placement.anchor_m[1],
+                parent_full_x_m=(
+                    placement.parent_profile_origin_m[0]
+                    if placement.parent_profile_origin_m is not None
+                    else None
+                ),
+                parent_full_y_m=(
+                    placement.parent_profile_origin_m[1]
+                    if placement.parent_profile_origin_m is not None
+                    else None
+                ),
+            )
+        )
+    return poses
+
+
+def lawnmower_scan_profile_polygon(
+    placement: LawnmowerScanPlacement,
+    profile_config: RainbowProfileConfig | None = None,
+) -> np.ndarray:
+    """Return the transformed full or local-half lawnmower footprint."""
+    if placement.profile_variant == "full":
+        local_profile = make_rainbow_profile(profile_config)
+    else:
+        halves = make_rainbow_profile_halves(profile_config)
+        if placement.profile_variant == "left_half":
+            local_profile = halves.left_half.polygon
+        elif placement.profile_variant == "right_half":
+            local_profile = halves.right_half.polygon
+        else:
+            raise ValueError(f"Unsupported lawnmower profile variant: {placement.profile_variant}")
+    return transform_profile(
+        local_profile,
+        placement.profile_origin_m[0],
+        placement.profile_origin_m[1],
+        placement.heading_rad,
+    )
+
+
+def _reflect_lawnmower_polygon(
+    polygon: np.ndarray,
+    orientation: str,
+    tank: TankCircleEstimate,
+) -> np.ndarray:
+    reflected = np.asarray(polygon, dtype=float).copy()
+    if orientation == "vertical":
+        reflected[:, 0] = 2.0 * tank.center_x - reflected[:, 0]
+    else:
+        reflected[:, 1] = 2.0 * tank.center_y - reflected[:, 1]
+    return reflected
+
+
+def measure_lawnmower_symmetry(
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    tank: TankCircleEstimate,
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> list[LawnmowerSymmetryMetrics]:
+    """Return anchor, guide, and reflected-polygon errors for mirrored pairs."""
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    plan = detect_lawnmower_guide_symmetry(lines, tank)
+    metrics: list[LawnmowerSymmetryMetrics] = []
+    for pair in plan.pairs:
+        if pair.right_line_id is None:
+            continue
+        first = sorted(
+            (
+                placement
+                for placement in placements
+                if placement.guide_line_id == pair.left_line_id
+            ),
+            key=lambda placement: (
+                placement.anchor_m[1]
+                if pair.orientation == "vertical"
+                else placement.anchor_m[0]
+            ),
+        )
+        second = sorted(
+            (
+                placement
+                for placement in placements
+                if placement.guide_line_id == pair.right_line_id
+            ),
+            key=lambda placement: (
+                placement.anchor_m[1]
+                if pair.orientation == "vertical"
+                else placement.anchor_m[0]
+            ),
+        )
+        first_anchors = [
+            placement.anchor_m[1]
+            if pair.orientation == "vertical"
+            else placement.anchor_m[0]
+            for placement in first
+        ]
+        second_anchors = [
+            placement.anchor_m[1]
+            if pair.orientation == "vertical"
+            else placement.anchor_m[0]
+            for placement in second
+        ]
+        if len(first_anchors) != len(second_anchors):
+            maximum_anchor_error = math.inf
+            maximum_polygon_error = math.inf
+        else:
+            maximum_anchor_error = max(
+                (
+                    abs(first_anchor - second_anchor)
+                    for first_anchor, second_anchor in zip(
+                        first_anchors,
+                        second_anchors,
+                    )
+                ),
+                default=0.0,
+            )
+            polygon_errors: list[float] = []
+            for first_placement, second_placement in zip(first, second):
+                first_polygon = lawnmower_scan_profile_polygon(
+                    first_placement,
+                    profile_config,
+                )
+                reflected = as_polygon(
+                    _reflect_lawnmower_polygon(
+                        first_polygon,
+                        pair.orientation,
+                        tank,
+                    )
+                )
+                second_polygon = as_polygon(
+                    lawnmower_scan_profile_polygon(
+                        second_placement,
+                        profile_config,
+                    )
+                )
+                polygon_errors.append(
+                    float(reflected.symmetric_difference(second_polygon).area)
+                    / max(float(second_polygon.area), GEOMETRY_EPSILON)
+                )
+            maximum_polygon_error = max(polygon_errors, default=0.0)
+        metrics.append(
+            LawnmowerSymmetryMetrics(
+                pair_id=pair.pair_id,
+                orientation=pair.orientation,
+                first_line_id=pair.left_line_id,
+                second_line_id=pair.right_line_id,
+                cross_mirror_error_m=pair.cross_mirror_error_m,
+                scan_count_difference=abs(len(first) - len(second)),
+                maximum_anchor_error_m=maximum_anchor_error,
+                maximum_polygon_error_fraction=maximum_polygon_error,
+            )
+        )
+    return metrics
+
+
+def scan_pose_profile_polygon(
+    pose: SweepPose,
+    profile_config: RainbowProfileConfig | None = None,
+) -> np.ndarray:
+    """Return the serialized pose's actual full or local-half footprint."""
+    if pose.stage == "circular_edge" and pose.profile_variant != "full":
+        raise ValueError("Circular sweep poses cannot use half-profile variants.")
+    if pose.profile_variant == "full":
+        local_profile = make_rainbow_profile(profile_config)
+    else:
+        halves = make_rainbow_profile_halves(profile_config)
+        if pose.profile_variant == "left_half":
+            local_profile = halves.left_half.polygon
+        elif pose.profile_variant == "right_half":
+            local_profile = halves.right_half.polygon
+        else:
+            raise ValueError(f"Unsupported scan profile variant: {pose.profile_variant}")
+    return transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+
+
+def lawnmower_long_side_endpoints(
+    placement: LawnmowerScanPlacement,
+    profile_config: RainbowProfileConfig | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the transformed endpoints of the profile's 1.600 m outer chord."""
+    local_profile = make_rainbow_profile(profile_config)
+    start, end = _rainbow_long_side_endpoints(local_profile)
+    rotation = np.array(
+        [
+            [math.cos(placement.heading_rad), -math.sin(placement.heading_rad)],
+            [math.sin(placement.heading_rad), math.cos(placement.heading_rad)],
+        ],
+        dtype=float,
+    )
+    origin = np.asarray(placement.profile_origin_m, dtype=float)
+    return start @ rotation.T + origin, end @ rotation.T + origin
+
+
+def estimate_lawnmower_neighbor_overlap_fraction(
+    first: LawnmowerScanPlacement,
+    second: LawnmowerScanPlacement,
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+) -> float:
+    """Estimate the actual polygon intersection area fraction for neighboring scans."""
+    local_profile = make_rainbow_profile(profile_config)
+    sample_points = _profile_interior_sample_points(local_profile)
+    first_polygon = transform_profile(
+        local_profile,
+        first.profile_origin_m[0],
+        first.profile_origin_m[1],
+        first.heading_rad,
+    )
+    second_polygon = transform_profile(
+        local_profile,
+        second.profile_origin_m[0],
+        second.profile_origin_m[1],
+        second.heading_rad,
+    )
+    first_samples = transform_profile(
+        sample_points,
+        first.profile_origin_m[0],
+        first.profile_origin_m[1],
+        first.heading_rad,
+    )
+    second_samples = transform_profile(
+        sample_points,
+        second.profile_origin_m[0],
+        second.profile_origin_m[1],
+        second.heading_rad,
+    )
+    return _estimate_neighbor_overlap_fraction(
+        first_polygon,
+        second_polygon,
+        first_sample_points=first_samples,
+        second_sample_points=second_samples,
+    )
+
+
+def _rainbow_long_side_endpoints(local_profile: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Find the outer 1.600 m chord from the upper endpoints of the side drops."""
+    min_x = float(np.min(local_profile[:, 0]))
+    max_x = float(np.max(local_profile[:, 0]))
+    tolerance = 1e-9
+    left_candidates = local_profile[np.isclose(local_profile[:, 0], min_x, atol=tolerance)]
+    right_candidates = local_profile[np.isclose(local_profile[:, 0], max_x, atol=tolerance)]
+    if len(left_candidates) == 0 or len(right_candidates) == 0:
+        raise ValueError("Rainbow profile does not contain identifiable long-side endpoints.")
+    left = left_candidates[np.argmax(left_candidates[:, 1])]
+    right = right_candidates[np.argmax(right_candidates[:, 1])]
+    expected_width = max_x - min_x
+    if not math.isclose(float(np.linalg.norm(right - left)), expected_width, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError("Rainbow profile does not preserve its long-side chord width.")
+    return left.copy(), right.copy()
+
+
+def _lawnmower_spacing_for_overlap(
+    local_profile: np.ndarray,
+    target_overlap_fraction: float,
+) -> float:
+    """Find local-y translation with the requested sampled polygon-area overlap."""
+    depth = float(np.max(local_profile[:, 1]) - np.min(local_profile[:, 1]))
+    if depth <= SECTION_MIN_LENGTH_M:
+        raise ValueError("Rainbow profile must have positive depth along a lawnmower guide line.")
+    sample_points = _profile_interior_sample_points(local_profile)
+    lower = 0.0
+    upper = depth
+    for _ in range(45):
+        midpoint = (lower + upper) / 2.0
+        overlap = _estimate_neighbor_overlap_fraction(
+            local_profile,
+            local_profile + np.array([0.0, midpoint]),
+            first_sample_points=sample_points,
+            second_sample_points=sample_points + np.array([0.0, midpoint]),
+        )
+        if overlap > target_overlap_fraction:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return float((lower + upper) / 2.0)
+
+
+def _lawnmower_anchor_distances(
+    line_length_m: float,
+    local_profile: np.ndarray,
+    local_anchor: np.ndarray,
+    target_step_m: float,
+) -> np.ndarray:
+    relative_progress = local_profile[:, 1] - local_anchor[1]
+    minimum_progress = float(np.min(relative_progress))
+    maximum_progress = float(np.max(relative_progress))
+    coverage_depth = maximum_progress - minimum_progress
+    if coverage_depth <= SECTION_MIN_LENGTH_M:
+        return np.array([line_length_m / 2.0])
+
+    first_anchor = max(0.0, -minimum_progress)
+    last_anchor = min(line_length_m, line_length_m - maximum_progress)
+    if line_length_m <= coverage_depth:
+        if last_anchor < first_anchor:
+            return np.array([line_length_m / 2.0])
+        return np.array([(first_anchor + last_anchor) / 2.0])
+
+    anchor_span = last_anchor - first_anchor
+    interval_count = max(1, int(math.ceil(anchor_span / target_step_m)))
+    total_coverage = coverage_depth + interval_count * target_step_m
+    endpoint_overhang = (total_coverage - line_length_m) / 2.0
+    first_anchor -= endpoint_overhang
+    return first_anchor + np.arange(interval_count + 1, dtype=float) * target_step_m
+
+
+def _line_travel_direction(direction: np.ndarray) -> str:
+    if abs(direction[0]) >= abs(direction[1]):
+        return "right" if direction[0] >= 0.0 else "left"
+    return "up" if direction[1] >= 0.0 else "down"
+
+
+def _canonical_lawnmower_line_reference(
+    start: np.ndarray,
+    end: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a stable endpoint order so reversing a guide reverses only traversal."""
+    if (float(start[0]), float(start[1])) <= (float(end[0]), float(end[1])):
+        canonical_start = start
+        canonical_end = end
+    else:
+        canonical_start = end
+        canonical_end = start
+    canonical_direction = canonical_end - canonical_start
+    canonical_direction /= np.linalg.norm(canonical_direction)
+    return canonical_start, canonical_direction
+
+
+def _is_effectively_duplicate_lawnmower_placement(
+    candidate: LawnmowerScanPlacement,
+    placements: list[LawnmowerScanPlacement],
+) -> bool:
+    return any(
+        math.hypot(
+            candidate.profile_origin_m[0] - existing.profile_origin_m[0],
+            candidate.profile_origin_m[1] - existing.profile_origin_m[1],
+        )
+        <= INTERIOR_POSE_POSITION_TOLERANCE_M
+        and _angle_difference(candidate.heading_rad, existing.heading_rad)
+        <= INTERIOR_POSE_ANGLE_TOLERANCE_RAD
+        for existing in placements
+    )
+
+
+def _vertical_lawnmower_section_specs(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+) -> list[tuple[float, float, float, int]]:
+    """Preserve existing column centers while retaining real vertical fragment gaps."""
+    columns = detect_vertical_plate_columns(model, tank)
+    grouped = _group_axis_segments(_iter_geometry_segments(model), "vertical")
+    specs: list[tuple[float, float, float, int]] = []
+    for column in columns:
+        left_intervals = _axis_group_intervals_at_coordinate(grouped, column.left_weld_x_m)
+        right_intervals = _axis_group_intervals_at_coordinate(grouped, column.right_weld_x_m)
+        if not left_intervals or not right_intervals:
+            continue
+        common_intervals = _intersect_interval_sets(
+            _merge_intervals(left_intervals),
+            _merge_intervals(right_intervals),
+        )
+        for start, end in common_intervals:
+            start = max(start, column.min_y_m)
+            end = min(end, column.max_y_m)
+            if end - start > SECTION_MIN_LENGTH_M:
+                specs.append((column.center_x_m, start, end, column.column_id))
+    specs = _add_short_vertical_fragment_columns(specs, grouped, columns)
+    return sorted(specs, key=lambda item: (item[0], item[1], item[2], item[3]))
+
+
+def _add_short_vertical_fragment_columns(
+    specs: list[tuple[float, float, float, int]],
+    groups: list[tuple[float, list[tuple[float, float]], int]],
+    columns: list[VerticalPlateColumn],
+) -> list[tuple[float, float, float, int]]:
+    """Add plate centers bounded by short weld fragments in the dominant row bands."""
+    widths = [column.right_weld_x_m - column.left_weld_x_m for column in columns]
+    if not specs or not widths:
+        return specs
+    target_spacing = float(np.median(widths))
+    spacing_tolerance = max(
+        HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M,
+        target_spacing * HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION,
+    )
+
+    interval_bands: list[list[float]] = []
+    for _center_x_m, start_m, end_m, _source_section_id in specs:
+        matched_band = next(
+            (
+                band
+                for band in interval_bands
+                if abs(band[0] - start_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(band[1] - end_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+            ),
+            None,
+        )
+        if matched_band is None:
+            interval_bands.append([start_m, end_m, 1.0])
+        else:
+            count = matched_band[2]
+            matched_band[0] = (matched_band[0] * count + start_m) / (count + 1.0)
+            matched_band[1] = (matched_band[1] * count + end_m) / (count + 1.0)
+            matched_band[2] = count + 1.0
+    maximum_support = max(band[2] for band in interval_bands)
+    dominant_bands = [
+        (band[0], band[1])
+        for band in interval_bands
+        if band[2] >= maximum_support - 0.5
+    ]
+    if len(dominant_bands) < 3:
+        return specs
+
+    merged_groups = [
+        (cross_m, _merge_intervals(intervals))
+        for cross_m, intervals, _source_count in groups
+    ]
+    paired_centers: list[float] = []
+    for left_index, (left_x_m, left_intervals) in enumerate(merged_groups):
+        for right_x_m, right_intervals in merged_groups[left_index + 1 :]:
+            separation = right_x_m - left_x_m
+            if separation > target_spacing + spacing_tolerance:
+                break
+            if abs(separation - target_spacing) > spacing_tolerance:
+                continue
+            common_intervals = _intersect_interval_sets(left_intervals, right_intervals)
+            if any(
+                min(common_end, band_end) - max(common_start, band_start) > SECTION_MIN_LENGTH_M
+                for common_start, common_end in common_intervals
+                for band_start, band_end in dominant_bands
+            ):
+                paired_centers.append((left_x_m + right_x_m) / 2.0)
+
+    result = list(specs)
+    next_source_id = max(spec[3] for spec in specs) + 1
+    for center_x_m in sorted(paired_centers):
+        for band_start, band_end in sorted(dominant_bands):
+            duplicate = any(
+                abs(existing_x_m - center_x_m) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(existing_start_m - band_start) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                and abs(existing_end_m - band_end) <= SECTION_BOUNDARY_MATCH_TOLERANCE_M
+                for existing_x_m, existing_start_m, existing_end_m, _source_id in result
+            )
+            if not duplicate:
+                result.append((center_x_m, band_start, band_end, next_source_id))
+                next_source_id += 1
+    return result
+
+
+def _horizontal_lawnmower_section_specs(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+    vertical_specs: list[tuple[float, float, float, int]],
+) -> list[tuple[float, float, float, int]]:
+    """Pair horizontal weld fragments at the detected plate short-side spacing."""
+    groups = _group_axis_segments(_iter_geometry_segments(model), "horizontal")
+    if len(groups) < 2:
+        return []
+    merged_groups = [
+        (cross_m, _merge_intervals(intervals, HORIZONTAL_FRAGMENT_MERGE_GAP_M))
+        for cross_m, intervals, _source_count in groups
+    ]
+    target_spacing = _detected_plate_short_side_spacing(model, tank, merged_groups)
+    if target_spacing is None:
+        return []
+    spacing_tolerance = max(
+        HORIZONTAL_PLATE_SPACING_MIN_TOLERANCE_M,
+        target_spacing * HORIZONTAL_PLATE_SPACING_TOLERANCE_FRACTION,
+    )
+
+    raw_specs: list[tuple[float, float, float]] = []
+    for lower_index, (lower_y, lower_intervals) in enumerate(merged_groups):
+        for upper_y, upper_intervals in merged_groups[lower_index + 1 :]:
+            separation = upper_y - lower_y
+            if separation > target_spacing + spacing_tolerance:
+                break
+            if abs(separation - target_spacing) > spacing_tolerance:
+                continue
+            for progress_min, progress_max in _intersect_interval_sets(lower_intervals, upper_intervals):
+                clipped = _clip_axis_section_to_tank(
+                    "horizontal",
+                    (lower_y + upper_y) / 2.0,
+                    progress_min,
+                    progress_max,
+                    tank,
+                )
+                if clipped is not None:
+                    raw_specs.append(((lower_y + upper_y) / 2.0, clipped[0], clipped[1]))
+
+    grouped_specs: list[tuple[float, list[tuple[float, float]]]] = []
+    for center_y_m, progress_min_m, progress_max_m in sorted(raw_specs):
+        if grouped_specs and abs(center_y_m - grouped_specs[-1][0]) <= HORIZONTAL_Y_GROUP_TOLERANCE_M:
+            grouped_specs[-1][1].append((progress_min_m, progress_max_m))
+        else:
+            grouped_specs.append((center_y_m, [(progress_min_m, progress_max_m)]))
+
+    specs: list[tuple[float, float, float, int]] = []
+    for center_y_m, intervals in grouped_specs:
+        for progress_min_m, progress_max_m in _merge_intervals(intervals, HORIZONTAL_FRAGMENT_MERGE_GAP_M):
+            for clear_min_m, clear_max_m in _subtract_active_vertical_contacts(
+                center_y_m,
+                progress_min_m,
+                progress_max_m,
+                vertical_specs,
+            ):
+                if clear_max_m - clear_min_m > SECTION_MIN_LENGTH_M:
+                    specs.append((center_y_m, clear_min_m, clear_max_m, len(specs)))
+    return sorted(specs, key=lambda item: (item[0], item[1], item[2], item[3]))
+
+
+def _detected_plate_short_side_spacing(
+    model: GeometryModel,
+    tank: TankCircleEstimate,
+    horizontal_groups: list[tuple[float, list[tuple[float, float]]]],
+) -> float | None:
+    columns = detect_vertical_plate_columns(model, tank)
+    widths = [column.right_weld_x_m - column.left_weld_x_m for column in columns]
+    if widths:
+        return float(np.median(widths))
+    cross_values = sorted(cross_m for cross_m, intervals in horizontal_groups if intervals)
+    gaps = np.diff(cross_values)
+    gaps = gaps[gaps > SECTION_MIN_LENGTH_M]
+    if len(gaps) == 0:
+        return None
+    return float(np.median(gaps))
+
+
+def _subtract_active_vertical_contacts(
+    center_y_m: float,
+    progress_min_m: float,
+    progress_max_m: float,
+    vertical_specs: list[tuple[float, float, float, int]],
+) -> list[tuple[float, float]]:
+    intervals = [(progress_min_m, progress_max_m)]
+    blockers = sorted(
+        center_x_m
+        for center_x_m, min_y_m, max_y_m, _source_section_id in vertical_specs
+        if min_y_m - SECTION_MIN_LENGTH_M <= center_y_m <= max_y_m + SECTION_MIN_LENGTH_M
+        and progress_min_m - PERPENDICULAR_SECTION_CLEARANCE_M
+        <= center_x_m
+        <= progress_max_m + PERPENDICULAR_SECTION_CLEARANCE_M
+    )
+    for blocker_x_m in blockers:
+        blocked_min = blocker_x_m - PERPENDICULAR_SECTION_CLEARANCE_M
+        blocked_max = blocker_x_m + PERPENDICULAR_SECTION_CLEARANCE_M
+        next_intervals: list[tuple[float, float]] = []
+        for start, end in intervals:
+            if blocked_max <= start or blocked_min >= end:
+                next_intervals.append((start, end))
+                continue
+            if blocked_min - start > SECTION_MIN_LENGTH_M:
+                next_intervals.append((start, min(end, blocked_min)))
+            if end - blocked_max > SECTION_MIN_LENGTH_M:
+                next_intervals.append((max(start, blocked_max), end))
+        intervals = next_intervals
+    return intervals
+
+
+def _axis_group_intervals_at_coordinate(
+    groups: list[tuple[float, list[tuple[float, float]], int]],
+    coordinate_m: float,
+) -> list[tuple[float, float]]:
+    closest = min(groups, key=lambda item: abs(item[0] - coordinate_m), default=None)
+    if closest is None or abs(closest[0] - coordinate_m) > SECTION_BOUNDARY_MATCH_TOLERANCE_M:
+        return []
+    return closest[1]
+
+
+def _intersect_interval_sets(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    intersections: list[tuple[float, float]] = []
+    first_index = 0
+    second_index = 0
+    while first_index < len(first) and second_index < len(second):
+        first_start, first_end = first[first_index]
+        second_start, second_end = second[second_index]
+        start = max(first_start, second_start)
+        end = min(first_end, second_end)
+        if end - start > SECTION_MIN_LENGTH_M:
+            intersections.append((start, end))
+        if first_end < second_end:
+            first_index += 1
+        else:
+            second_index += 1
+    return intersections
+
+
+def _clip_axis_section_to_tank(
+    orientation: str,
+    cross_m: float,
+    progress_min_m: float,
+    progress_max_m: float,
+    tank: TankCircleEstimate,
+) -> tuple[float, float] | None:
+    if orientation == "vertical":
+        cross_offset = cross_m - tank.center_x
+        progress_center = tank.center_y
+    elif orientation == "horizontal":
+        cross_offset = cross_m - tank.center_y
+        progress_center = tank.center_x
+    else:
+        raise ValueError("Section orientation must be 'vertical' or 'horizontal'.")
+    if abs(cross_offset) >= tank.radius:
+        return None
+    half_chord = math.sqrt(max(0.0, tank.radius**2 - cross_offset**2))
+    lower = max(progress_min_m, progress_center - half_chord)
+    upper = min(progress_max_m, progress_center + half_chord)
+    if upper - lower <= SECTION_MIN_LENGTH_M:
+        return None
+    return float(lower), float(upper)
 
 
 def generate_interior_vertical_poses(
@@ -1101,12 +2939,7 @@ def generate_interior_vertical_poses(
     local_profile = make_rainbow_profile(profile_config)
     touching_step = _touching_vertical_step(local_profile)
     target_step = touching_step * vertical_spacing_factor
-    edge_polygons = [
-        transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
-        for pose in edge_poses
-        if pose.stage == "circular_edge"
-    ]
-    edge_polygon_records = [(polygon, _polygon_bounds(polygon)) for polygon in edge_polygons]
+    edge_polygon_records = _circular_edge_polygon_records(local_profile, edge_poses)
     regular_columns = _expand_vertical_columns_to_edge(
         columns,
         tank,
@@ -1144,6 +2977,145 @@ def generate_interior_vertical_poses(
     kept.extend(side_guard_poses)
     discarded_count += side_guard_discarded
     return kept, discarded_count
+
+
+def generate_interior_horizontal_poses(
+    sections: list[InteriorSection],
+    tank: TankCircleEstimate,
+    edge_poses: list[SweepPose],
+    *,
+    scan_id_start: int,
+    profile_config: RainbowProfileConfig,
+    vertical_spacing_factor: float,
+    overlap_discard_threshold: float,
+    previous_pose: SweepPose | None = None,
+) -> tuple[list[SweepPose], int, int]:
+    """Generate alternating left/right scans along detected horizontal sections."""
+    local_profile = make_rainbow_profile(profile_config)
+    heading_rad = math.pi / 2.0
+    rotated_profile = transform_profile(local_profile, 0.0, 0.0, heading_rad)
+    target_step = _touching_vertical_step(local_profile) * vertical_spacing_factor
+    edge_polygon_records = _circular_edge_polygon_records(local_profile, edge_poses)
+    ordered_sections = sorted(sections, key=lambda section: (section.center_cross_m, section.progress_min_m))
+
+    valid_rows: list[tuple[InteriorSection, np.ndarray]] = []
+    invalid_count = 0
+    for section in ordered_sections:
+        x_positions = _horizontal_section_x_positions(section, tank, rotated_profile, target_step)
+        if x_positions is None or len(x_positions) == 0:
+            invalid_count += 1
+            continue
+        valid_rows.append((section, x_positions))
+    if not valid_rows:
+        return [], 0, invalid_count
+
+    first_positions = valid_rows[0][1]
+    first_moves_right = True
+    if previous_pose is not None:
+        first_section = valid_rows[0][0]
+        left_distance = math.hypot(
+            previous_pose.x_m - float(first_positions[0]),
+            previous_pose.y_m - first_section.center_cross_m,
+        )
+        right_distance = math.hypot(
+            previous_pose.x_m - float(first_positions[-1]),
+            previous_pose.y_m - first_section.center_cross_m,
+        )
+        first_moves_right = left_distance <= right_distance
+
+    kept: list[SweepPose] = []
+    discarded_count = 0
+    for row_index, (section, x_positions) in enumerate(valid_rows):
+        moves_right = first_moves_right if row_index % 2 == 0 else not first_moves_right
+        ordered_x = x_positions if moves_right else x_positions[::-1]
+        travel_direction = "right" if moves_right else "left"
+        for x_m in ordered_x:
+            world_profile = transform_profile(
+                local_profile,
+                float(x_m),
+                section.center_cross_m,
+                heading_rad,
+            )
+            overlap_ratio = _estimate_union_overlap_ratio(world_profile, edge_polygon_records)
+            if overlap_ratio > overlap_discard_threshold:
+                discarded_count += 1
+                continue
+            kept.append(
+                SweepPose(
+                    scan_id=scan_id_start + len(kept),
+                    stage="interior_horizontal",
+                    x_m=float(x_m),
+                    y_m=section.center_cross_m,
+                    heading_rad=heading_rad,
+                    heading_deg=math.degrees(heading_rad),
+                    row_id=section.section_id,
+                    row_name="horizontal_section",
+                    orientation="horizontal",
+                    group_id=row_index,
+                    section_id=section.section_id,
+                    travel_direction=travel_direction,
+                )
+            )
+    return kept, discarded_count, invalid_count
+
+
+def _horizontal_section_x_positions(
+    section: InteriorSection,
+    tank: TankCircleEstimate,
+    rotated_profile: np.ndarray,
+    target_step: float,
+) -> np.ndarray | None:
+    x_bounds = _profile_center_x_bounds_at_y(
+        section.center_cross_m,
+        tank,
+        rotated_profile,
+        section.progress_min_m,
+        section.progress_max_m,
+    )
+    if x_bounds is None:
+        return None
+    x_min, x_max = x_bounds
+    span = x_max - x_min
+    interval_count = max(1, int(math.ceil(span / target_step)))
+    return np.linspace(x_min, x_max, interval_count + 1)
+
+
+def _circular_edge_polygon_records(
+    local_profile: np.ndarray,
+    poses: list[SweepPose],
+) -> list[tuple[np.ndarray, tuple[float, float, float, float]]]:
+    polygons = [
+        transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+        for pose in poses
+        if pose.stage == "circular_edge"
+    ]
+    return [(polygon, _polygon_bounds(polygon)) for polygon in polygons]
+
+
+def _deduplicate_interior_poses(
+    poses: list[SweepPose],
+    *,
+    scan_id_start: int,
+) -> tuple[list[SweepPose], int]:
+    kept: list[SweepPose] = []
+    removed = 0
+    for pose in poses:
+        duplicate = any(
+            math.hypot(pose.x_m - existing.x_m, pose.y_m - existing.y_m)
+            <= INTERIOR_POSE_POSITION_TOLERANCE_M
+            and _angle_difference(pose.heading_rad, existing.heading_rad)
+            <= INTERIOR_POSE_ANGLE_TOLERANCE_RAD
+            for existing in kept
+        )
+        if duplicate:
+            removed += 1
+            continue
+        kept.append(replace(pose, scan_id=scan_id_start + len(kept)))
+    return kept, removed
+
+
+def _angle_difference(first: float, second: float) -> float:
+    return abs((first - second + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 def _expand_vertical_columns_to_edge(
@@ -1263,7 +3235,8 @@ def _generate_regular_vertical_column_poses(
     y_positions = _regular_vertical_column_y_positions(column, tank, local_profile, target_step)
     if y_positions is None:
         return [], 0
-    if column_index % 2 == 1:
+    travel_direction = "down" if column_index % 2 == 1 else "up"
+    if travel_direction == "down":
         y_positions = y_positions[::-1]
 
     kept: list[SweepPose] = []
@@ -1284,6 +3257,10 @@ def _generate_regular_vertical_column_poses(
                 heading_deg=0.0,
                 column_id=column.column_id,
                 row_name="expanded_vertical" if column.column_id < 0 or column.column_id >= 1000 else None,
+                orientation="vertical",
+                group_id=column_index,
+                section_id=column.column_id,
+                travel_direction=travel_direction,
             )
         )
     return kept, discarded_count
@@ -1346,7 +3323,8 @@ def _generate_side_guard_poses(
         span = y_max - y_min
         interval_count = max(1, int(math.ceil(span / target_step)))
         y_positions = np.linspace(y_min, y_max, interval_count + 1)
-        if side_index % 2 == 1:
+        travel_direction = "down" if side_index % 2 == 1 else "up"
+        if travel_direction == "down":
             y_positions = y_positions[::-1]
 
         for y_m in y_positions:
@@ -1365,10 +3343,181 @@ def _generate_side_guard_poses(
                     heading_deg=math.degrees(SIDE_GUARD_HEADING_RAD),
                     column_id=column_id,
                     row_name=f"{side_name}_rotated_side_guard",
+                    orientation="vertical",
+                    group_id=len(columns) + side_index,
+                    section_id=column_id,
+                    travel_direction=travel_direction,
                 )
             )
 
     return kept, discarded_count
+
+
+def save_lawnmower_section_lines_json(
+    lines: list[LawnmowerSectionLine],
+    filepath: str | Path,
+) -> Path:
+    """Save the section-only geometry without mission poses or circular data."""
+    path = Path(filepath)
+    data = {
+        "units": "meters",
+        "section_count": len(lines),
+        "sections": [asdict(line) for line in lines],
+    }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def plot_lawnmower_section_lines(
+    model: GeometryModel,
+    lines: list[LawnmowerSectionLine],
+    *,
+    show: bool = True,
+    save_path: str | Path | None = None,
+) -> Any:
+    """Plot imported geometry plus straight interior section lines only."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    fig, ax = plt.subplots(figsize=(11, 11))
+    _plot_imported_geometry_background(ax, model)
+    colors = {"vertical": "#16a34a", "horizontal": "#dc2626"}
+    labels_drawn: set[str] = set()
+    for line in lines:
+        color = colors[line.orientation]
+        label = f"Generated {line.orientation} sections" if line.orientation not in labels_drawn else "_nolegend_"
+        labels_drawn.add(line.orientation)
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color=color,
+            linewidth=2.2,
+            alpha=0.92,
+            label=label,
+            zorder=4,
+        )
+
+    if model.bounds is not None:
+        span = max(model.bounds.width, model.bounds.height, 1e-9)
+        margin = span * 0.04
+        ax.set_xlim(model.bounds.min_x - margin, model.bounds.max_x + margin)
+        ax.set_ylim(model.bounds.min_y - margin, model.bounds.max_y + margin)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title("Interior lawnmower section lines only")
+    ax.grid(True, alpha=0.18)
+    if lines:
+        ax.legend(loc="upper right")
+    else:
+        ax.legend(
+            handles=[Line2D([], [], color="#6b7280", label="Imported geometry")],
+            loc="upper right",
+        )
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200)
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_lawnmower_scan_placements(
+    model: GeometryModel,
+    lines: list[LawnmowerSectionLine],
+    placements: list[LawnmowerScanPlacement],
+    *,
+    profile_config: RainbowProfileConfig | None = None,
+    show: bool = True,
+    save_path: str | Path | None = None,
+) -> Any:
+    """Plot existing guide lines and their anchored interior rainbow footprints only."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    profile_config = RainbowProfileConfig() if profile_config is None else profile_config
+    fig, ax = plt.subplots(figsize=(11, 11))
+    _plot_imported_geometry_background(ax, model)
+
+    guide_colors = {"vertical": "#16a34a", "horizontal": "#dc2626"}
+    guide_labels_drawn: set[str] = set()
+    for line in lines:
+        start = np.asarray(line.start_m, dtype=float)
+        end = np.asarray(line.end_m, dtype=float)
+        label = (
+            f"Existing {line.orientation} guide lines"
+            if line.orientation not in guide_labels_drawn
+            else "_nolegend_"
+        )
+        guide_labels_drawn.add(line.orientation)
+        ax.plot(
+            [start[0], end[0]],
+            [start[1], end[1]],
+            color=guide_colors[line.orientation],
+            linewidth=1.8,
+            alpha=0.9,
+            label=label,
+            zorder=5,
+        )
+
+    for placement_index, placement in enumerate(placements):
+        polygon = lawnmower_scan_profile_polygon(placement, profile_config)
+        closed = _closed_points(polygon)
+        ax.fill(
+            closed[:, 0],
+            closed[:, 1],
+            color="#7c3aed",
+            alpha=0.055,
+            linewidth=0.0,
+            zorder=3,
+        )
+        ax.plot(
+            closed[:, 0],
+            closed[:, 1],
+            color="#7c3aed",
+            linewidth=0.45,
+            alpha=0.65,
+            label="Interior rainbow profiles" if placement_index == 0 else "_nolegend_",
+            zorder=4,
+        )
+
+    if placements:
+        anchors = np.asarray([placement.anchor_m for placement in placements], dtype=float)
+        ax.scatter(
+            anchors[:, 0],
+            anchors[:, 1],
+            color="#f59e0b",
+            s=6,
+            alpha=0.9,
+            label="Long-side midpoint anchors",
+            zorder=6,
+        )
+
+    if model.bounds is not None:
+        span = max(model.bounds.width, model.bounds.height, 1e-9)
+        margin = span * 0.04
+        ax.set_xlim(model.bounds.min_x - margin, model.bounds.max_x + margin)
+        ax.set_ylim(model.bounds.min_y - margin, model.bounds.max_y + margin)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_title("Interior rainbow profiles anchored to existing lawnmower guide lines")
+    ax.grid(True, alpha=0.18)
+    if lines or placements:
+        ax.legend(loc="upper right")
+    else:
+        ax.legend(
+            handles=[Line2D([], [], color="#6b7280", label="Imported geometry")],
+            loc="upper right",
+        )
+    plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200)
+    if show:
+        plt.show()
+    return fig, ax
 
 
 def save_mission_json(mission: OuterEdgeSweepMission, filepath: str | Path) -> Path:
@@ -1396,6 +3545,15 @@ def save_mission_csv(mission: OuterEdgeSweepMission, filepath: str | Path) -> Pa
         "sweep_radius_m",
         "profile_type",
         "status",
+        "orientation",
+        "group_id",
+        "section_id",
+        "travel_direction",
+        "profile_variant",
+        "anchor_x_m",
+        "anchor_y_m",
+        "parent_full_x_m",
+        "parent_full_y_m",
     ]
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1427,31 +3585,6 @@ def plot_outer_edge_sweep(
         Circle((cx, cy), mission.tank_radius_m, fill=False, color="#111827", linewidth=2.0, label="Estimated tank boundary")
     )
     circular_palette = ["#2563eb", "#059669", "#d97706", "#be185d", "#0891b2"]
-    for row in mission.circular_rows:
-        color = circular_palette[row.row_id % len(circular_palette)]
-        ax.add_patch(
-            Circle(
-                (cx, cy),
-                row.sweep_radius_m,
-                fill=False,
-                color=color,
-                linestyle="--",
-                linewidth=1.5,
-                label="Accepted circular rows" if row.row_id == 0 else "_nolegend_",
-            )
-        )
-    if mission.rejected_circular_radius_m is not None and mission.rejected_circular_radius_m > 0.0:
-        ax.add_patch(
-            Circle(
-                (cx, cy),
-                mission.rejected_circular_radius_m,
-                fill=False,
-                color="#6b7280",
-                linestyle=":",
-                linewidth=1.4,
-                label=f"Circular stop: {mission.circular_stop_reason}",
-            )
-        )
 
     profile_config = RainbowProfileConfig(
         width=float(mission.scan_profile["width_m"]),
@@ -1465,20 +3598,40 @@ def plot_outer_edge_sweep(
     else:
         profile_stride = max(1, int(math.ceil(len(mission.poses) / max(1, max_profile_draw_count))))
     for pose in mission.poses[::profile_stride]:
-        world_profile = transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+        world_profile = scan_pose_profile_polygon(pose, profile_config)
         closed_profile = _closed_points(world_profile)
         if pose.stage == "circular_edge":
             color = circular_palette[int(pose.row_id or 0) % len(circular_palette)]
             style = {"color": color, "fill": color}
+        elif pose.stage == "interior_horizontal":
+            style = {"color": "#dc2626", "fill": "#fca5a5"}
         elif pose.stage == "interior_side_guard":
             style = {"color": "#0f766e", "fill": "#5eead4"}
         else:
             style = {"color": "#7c3aed", "fill": "#a78bfa"}
-        ax.fill(closed_profile[:, 0], closed_profile[:, 1], color=style["fill"], alpha=0.07, zorder=2)
-        ax.plot(closed_profile[:, 0], closed_profile[:, 1], color=style["color"], linewidth=0.7, alpha=0.38, zorder=3)
-
+        is_half = pose.profile_variant != "full"
+        if is_half:
+            style = {"color": "#0891b2", "fill": "#67e8f9"}
+        ax.fill(
+            closed_profile[:, 0],
+            closed_profile[:, 1],
+            color=style["fill"],
+            alpha=0.20 if is_half else 0.11,
+            zorder=2,
+        )
+        ax.plot(
+            closed_profile[:, 0],
+            closed_profile[:, 1],
+            color=style["color"],
+            linewidth=1.8 if is_half else 1.25,
+            linestyle="--" if is_half else "-",
+            alpha=0.95 if is_half else 0.82,
+            label="_scan_profile_outline",
+            zorder=3,
+        )
     circular_poses = [pose for pose in mission.poses if pose.stage == "circular_edge"]
     interior_poses = [pose for pose in mission.poses if pose.stage == "interior_vertical"]
+    horizontal_poses = [pose for pose in mission.poses if pose.stage == "interior_horizontal"]
     side_guard_poses = [pose for pose in mission.poses if pose.stage == "interior_side_guard"]
     for row in mission.circular_rows:
         row_poses = [pose for pose in circular_poses if pose.row_id == row.row_id]
@@ -1491,7 +3644,6 @@ def plot_outer_edge_sweep(
             label="_nolegend_",
             zorder=5,
         )
-        _plot_direction_arrows(ax, row_poses, label=None)
     if interior_poses:
         ax.scatter(
             [pose.x_m for pose in interior_poses],
@@ -1500,6 +3652,16 @@ def plot_outer_edge_sweep(
             color="#7c3aed",
             marker="s",
             label="Interior vertical centers",
+            zorder=5,
+        )
+    if horizontal_poses:
+        ax.scatter(
+            [pose.x_m for pose in horizontal_poses],
+            [pose.y_m for pose in horizontal_poses],
+            s=18,
+            color="#dc2626",
+            marker="^",
+            label="Interior horizontal centers",
             zorder=5,
         )
     if side_guard_poses:
@@ -1512,9 +3674,17 @@ def plot_outer_edge_sweep(
             label="_nolegend_",
             zorder=5,
         )
-    path_x = [pose.x_m for pose in mission.poses]
-    path_y = [pose.y_m for pose in mission.poses]
-    ax.plot(path_x, path_y, color="#f97316", linewidth=1.0, alpha=0.65, label="Ordered mission path", zorder=4)
+    half_poses = [pose for pose in mission.poses if pose.profile_variant != "full"]
+    if half_poses:
+        ax.scatter(
+            [pose.anchor_x_m for pose in half_poses],
+            [pose.anchor_y_m for pose in half_poses],
+            s=28,
+            color="#0e7490",
+            marker="x",
+            label="Salvaged half-profile anchors",
+            zorder=7,
+        )
     ax.scatter([cx], [cy], s=35, color="#111827", label="_nolegend_", zorder=6)
     _apply_plot_bounds(ax, model, mission)
     ax.set_aspect("equal", adjustable="box")
@@ -1591,12 +3761,22 @@ def print_mission_summary(
     print(f"Circular wrapping stop reason: {mission.circular_stop_reason}")
     print(f"Max circular gap fraction: {mission.max_circular_gap_fraction:.6g}")
     print(f"Total circular scans: {mission.edge_sweep_scan_count}")
-    print(f"Detected vertical plate columns: {len(mission.vertical_columns)}")
-    vertical_count = sum(1 for pose in mission.poses if pose.stage == "interior_vertical")
+    vertical_guides = sum(line.orientation == "vertical" for line in mission.lawnmower_section_lines)
+    horizontal_guides = sum(line.orientation == "horizontal" for line in mission.lawnmower_section_lines)
+    print(f"Lawnmower vertical guide lines: {vertical_guides}")
+    print(f"Lawnmower horizontal guide lines: {horizontal_guides}")
     side_guard_count = sum(1 for pose in mission.poses if pose.stage == "interior_side_guard")
-    print(f"Interior vertical scans kept: {vertical_count}")
+    print(f"Vertical groups: {mission.vertical_group_count}")
+    print(f"Horizontal groups: {mission.horizontal_group_count}")
+    print(f"Interior vertical scans kept: {mission.vertical_scan_count}")
+    print(f"Interior horizontal scans kept: {mission.horizontal_scan_count}")
+    print(f"Rejected interior full-profile candidates retained: {mission.rejected_full_profile_candidate_count}")
+    print(f"Salvaged left-half profiles: {sum(pose.profile_variant == 'left_half' for pose in mission.poses)}")
+    print(f"Salvaged right-half profiles: {sum(pose.profile_variant == 'right_half' for pose in mission.poses)}")
     print(f"Rotated side-guard scans kept: {side_guard_count}")
-    print(f"Interior vertical scans discarded by overlap: {mission.interior_discarded_count}")
+    print(f"Interior scans discarded by circular-overlap filter: {mission.interior_discarded_count}")
+    print(f"Duplicate interior poses removed: {mission.duplicate_poses_removed}")
+    print(f"Invalid horizontal segments/sections skipped: {mission.invalid_horizontal_segments_skipped}")
     print(f"Total mission scans: {len(mission.poses)}")
     if mission.circular_spacing_candidates:
         print("Circular spacing comparison")
@@ -1771,21 +3951,31 @@ def _polygons_overlap_or_touch(first: np.ndarray, second: np.ndarray, tolerance:
     first_polygon = _without_duplicate_closure(first)
     second_polygon = _without_duplicate_closure(second)
 
-    for first_index in range(len(first_polygon)):
-        first_start = first_polygon[first_index]
-        first_end = first_polygon[(first_index + 1) % len(first_polygon)]
-        for second_index in range(len(second_polygon)):
-            second_start = second_polygon[second_index]
-            second_end = second_polygon[(second_index + 1) % len(second_polygon)]
-            if (
-                max(first_start[0], first_end[0]) < min(second_start[0], second_end[0]) - tolerance
-                or min(first_start[0], first_end[0]) > max(second_start[0], second_end[0]) + tolerance
-                or max(first_start[1], first_end[1]) < min(second_start[1], second_end[1]) - tolerance
-                or min(first_start[1], first_end[1]) > max(second_start[1], second_end[1]) + tolerance
-            ):
-                continue
-            if _segments_intersect(first_start, first_end, second_start, second_end, tolerance):
-                return True
+    first_starts = first_polygon
+    first_ends = np.roll(first_polygon, -1, axis=0)
+    second_starts = second_polygon
+    second_ends = np.roll(second_polygon, -1, axis=0)
+
+    first_min = np.minimum(first_starts, first_ends)
+    first_max = np.maximum(first_starts, first_ends)
+    second_min = np.minimum(second_starts, second_ends)
+    second_max = np.maximum(second_starts, second_ends)
+    bounds_overlap = (
+        (first_max[:, None, 0] >= second_min[None, :, 0] - tolerance)
+        & (first_min[:, None, 0] <= second_max[None, :, 0] + tolerance)
+        & (first_max[:, None, 1] >= second_min[None, :, 1] - tolerance)
+        & (first_min[:, None, 1] <= second_max[None, :, 1] + tolerance)
+    )
+    first_indices, second_indices = np.nonzero(bounds_overlap)
+    for first_index, second_index in zip(first_indices, second_indices):
+        if _segments_intersect(
+            first_starts[first_index],
+            first_ends[first_index],
+            second_starts[second_index],
+            second_ends[second_index],
+            tolerance,
+        ):
+            return True
 
     return _point_in_polygon(first_polygon[0], second_polygon) or _point_in_polygon(second_polygon[0], first_polygon)
 
@@ -1921,38 +4111,60 @@ def _iter_geometry_segments(model: GeometryModel):
 
 
 def _group_vertical_segments(segments) -> list[tuple[float, list[tuple[float, float]]]]:
-    vertical: list[tuple[float, float, float, float]] = []
+    return [
+        (cross_m, intervals)
+        for cross_m, intervals, _source_count in _group_axis_segments(segments, "vertical")
+    ]
+
+
+def _group_axis_segments(
+    segments,
+    orientation: str,
+) -> list[tuple[float, list[tuple[float, float]], int]]:
+    if orientation not in {"vertical", "horizontal"}:
+        raise ValueError("Axis grouping orientation must be 'vertical' or 'horizontal'.")
+    classified: list[tuple[float, float, float, float]] = []
     for start, end in segments:
         delta = end - start
         length = float(np.linalg.norm(delta))
-        if length <= 1e-9 or abs(float(delta[0])) > VERTICAL_SLOPE_TOLERANCE * length:
+        off_axis_delta = float(delta[0] if orientation == "vertical" else delta[1])
+        if length <= 1e-9 or abs(off_axis_delta) > VERTICAL_SLOPE_TOLERANCE * length:
             continue
-        vertical.append(
+        cross_start = float(start[0] if orientation == "vertical" else start[1])
+        cross_end = float(end[0] if orientation == "vertical" else end[1])
+        progress_start = float(start[1] if orientation == "vertical" else start[0])
+        progress_end = float(end[1] if orientation == "vertical" else end[0])
+        classified.append(
             (
-                float((start[0] + end[0]) / 2.0),
-                float(min(start[1], end[1])),
-                float(max(start[1], end[1])),
+                (cross_start + cross_end) / 2.0,
+                min(progress_start, progress_end),
+                max(progress_start, progress_end),
                 length,
             )
         )
-    vertical.sort(key=lambda item: item[0])
+    classified.sort(key=lambda item: item[0])
 
     groups: list[list[tuple[float, float, float, float]]] = []
-    for segment in vertical:
+    cross_tolerance = (
+        VERTICAL_X_GROUP_TOLERANCE_M
+        if orientation == "vertical"
+        else HORIZONTAL_Y_GROUP_TOLERANCE_M
+    )
+    for segment in classified:
         if not groups:
             groups.append([segment])
             continue
         group_x = sum(item[0] * item[3] for item in groups[-1]) / sum(item[3] for item in groups[-1])
-        if abs(segment[0] - group_x) <= VERTICAL_X_GROUP_TOLERANCE_M:
+        if abs(segment[0] - group_x) <= cross_tolerance:
             groups[-1].append(segment)
         else:
             groups.append([segment])
 
-    grouped: list[tuple[float, list[tuple[float, float]]]] = []
+    grouped: list[tuple[float, list[tuple[float, float]], int]] = []
     for group in groups:
         total_length = sum(item[3] for item in group)
-        x_m = sum(item[0] * item[3] for item in group) / total_length
-        grouped.append((x_m, [(item[1], item[2]) for item in group]))
+        cross_m = sum(item[0] * item[3] for item in group) / total_length
+        grouped.append((cross_m, [(item[1], item[2]) for item in group], len(group)))
     return grouped
 
 
@@ -1999,6 +4211,31 @@ def _profile_center_y_bounds_at_x(
         vertical_limit = math.sqrt(max(0.0, tank.radius**2 - radial_x**2))
         lower = max(lower, tank.center_y - vertical_limit - float(local_y))
         upper = min(upper, tank.center_y + vertical_limit - float(local_y))
+    if upper < lower:
+        return None
+    return lower, upper
+
+
+def _profile_center_x_bounds_at_y(
+    center_y_m: float,
+    tank: TankCircleEstimate,
+    profile_points: np.ndarray,
+    min_x_hint: float,
+    max_x_hint: float,
+) -> tuple[float, float] | None:
+    """Transpose the vertical bounds check for a profile progressing horizontally."""
+    min_local_x = float(np.min(profile_points[:, 0]))
+    max_local_x = float(np.max(profile_points[:, 0]))
+    lower = min_x_hint - min_local_x
+    upper = max_x_hint - max_local_x
+
+    for local_x, local_y in profile_points:
+        radial_y = center_y_m + float(local_y) - tank.center_y
+        if abs(radial_y) >= tank.radius:
+            return None
+        horizontal_limit = math.sqrt(max(0.0, tank.radius**2 - radial_y**2))
+        lower = max(lower, tank.center_x - horizontal_limit - float(local_x))
+        upper = min(upper, tank.center_x + horizontal_limit - float(local_x))
     if upper < lower:
         return None
     return lower, upper
@@ -2088,10 +4325,8 @@ def _estimate_tank_coverage(
     grid_x, grid_y = np.meshgrid(xs, ys)
     tank_mask = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2 <= radius**2
     coverage_count = np.zeros((grid_resolution, grid_resolution), dtype=np.uint16)
-    local_profile = make_rainbow_profile(profile_config)
-
     for pose in mission.poses:
-        polygon = transform_profile(local_profile, pose.x_m, pose.y_m, pose.heading_rad)
+        polygon = scan_pose_profile_polygon(pose, profile_config)
         min_x, min_y, max_x, max_y = _polygon_bounds(polygon)
         x_start = max(0, int(math.floor((min_x - (center_x - radius)) / cell_size)))
         x_end = min(grid_resolution, int(math.ceil((max_x - (center_x - radius)) / cell_size)))
@@ -2189,6 +4424,31 @@ def _sample_arc_points(
     return np.column_stack((center_x + radius * np.cos(angles), center_y + radius * np.sin(angles)))
 
 
+def _plot_group_paths(
+    ax: Any,
+    poses: list[SweepPose],
+    color: str,
+    label: str,
+) -> None:
+    group_ids = []
+    for pose in poses:
+        if pose.group_id is not None and pose.group_id not in group_ids:
+            group_ids.append(pose.group_id)
+    for index, group_id in enumerate(group_ids):
+        group = [pose for pose in poses if pose.group_id == group_id]
+        if len(group) < 2:
+            continue
+        ax.plot(
+            [pose.x_m for pose in group],
+            [pose.y_m for pose in group],
+            color=color,
+            linewidth=1.2,
+            alpha=0.8,
+            label=label if index == 0 else "_nolegend_",
+            zorder=4,
+        )
+
+
 def _plot_direction_arrows(ax: Any, poses: list[SweepPose], *, label: str | None) -> None:
     if len(poses) < 2:
         return
@@ -2250,7 +4510,9 @@ def _normalize_angle(angle_rad: float) -> float:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plan edge sweeps and vertical interior coverage from a tank DXF.")
+    parser = argparse.ArgumentParser(
+        description="Plan edge sweeps and axis-aligned interior coverage from a tank DXF."
+    )
     parser.add_argument("dxf_path", help="Path to the tank floor DXF file.")
     parser.add_argument(
         "--outer-edge-offset",
@@ -2320,6 +4582,20 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--disable-interior", action="store_true", help="Generate only accepted circular edge rows.")
+    parser.add_argument(
+        "--section-lines-only",
+        action="store_true",
+        help="Generate and plot ordered interior straight section lines without profiles or circular sweeps.",
+    )
+    parser.add_argument(
+        "--lawnmower-profiles-only",
+        action="store_true",
+        help="Plot rainbow profiles anchored to existing interior guide lines without circular sweeps.",
+    )
+    parser.add_argument(
+        "--save-section-lines-json",
+        help="Optional JSON output for --section-lines-only geometry.",
+    )
     parser.add_argument("--clockwise", action="store_true", help="Generate poses in clockwise order.")
     parser.add_argument("--no-plot", action="store_true", help="Save plot without opening a matplotlib window.")
     parser.add_argument("--save-json", default=DEFAULT_JSON_PATH, help="Path for mission JSON output.")
@@ -2330,6 +4606,60 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if args.lawnmower_profiles_only:
+        try:
+            model = import_dxf(args.dxf_path)
+            lines = generate_lawnmower_section_lines(model)
+            placements = generate_lawnmower_scan_placements(lines)
+        except (DxfImportError, ValueError) as exc:
+            print(f"Lawnmower profile placement failed: {exc}")
+            return 1
+        plot_path = Path(args.save_plot) if args.save_plot else None
+        if args.save_plot or not args.no_plot:
+            plot_lawnmower_scan_placements(
+                model,
+                lines,
+                placements,
+                show=not args.no_plot,
+                save_path=plot_path,
+            )
+        vertical_count = sum(placement.orientation == "vertical" for placement in placements)
+        horizontal_count = sum(placement.orientation == "horizontal" for placement in placements)
+        print("Lawnmower rainbow profile summary")
+        print(f"Vertical guide-line profiles: {vertical_count}")
+        print(f"Horizontal guide-line profiles: {horizontal_count}")
+        print(f"Total interior profiles: {len(placements)}")
+        if plot_path is not None:
+            print(f"Plot output: {plot_path}")
+        return 0
+
+    if args.section_lines_only:
+        try:
+            model = import_dxf(args.dxf_path)
+            lines = generate_lawnmower_section_lines(model)
+        except (DxfImportError, ValueError) as exc:
+            print(f"Section-line generation failed: {exc}")
+            return 1
+        section_json_path = (
+            save_lawnmower_section_lines_json(lines, args.save_section_lines_json)
+            if args.save_section_lines_json
+            else None
+        )
+        plot_path = Path(args.save_plot) if args.save_plot else None
+        if args.save_plot or not args.no_plot:
+            plot_lawnmower_section_lines(model, lines, show=not args.no_plot, save_path=plot_path)
+        vertical_count = sum(line.orientation == "vertical" for line in lines)
+        horizontal_count = sum(line.orientation == "horizontal" for line in lines)
+        print("Lawnmower section-line summary")
+        print(f"Vertical section lines: {vertical_count}")
+        print(f"Horizontal section lines: {horizontal_count}")
+        print(f"Total section lines: {len(lines)}")
+        if section_json_path is not None:
+            print(f"Section JSON output: {section_json_path}")
+        if plot_path is not None:
+            print(f"Plot output: {plot_path}")
+        return 0
+
     _warn_for_spacing_factor(args.spacing_factor)
     _warn_for_row_spacing(args.row_spacing, RainbowProfileConfig())
     _warn_for_vertical_spacing_factor(args.vertical_spacing_factor)
@@ -2356,7 +4686,12 @@ def main() -> int:
     csv_path = save_mission_csv(mission, args.save_csv) if args.save_csv else None
     plot_path = Path(args.save_plot) if args.save_plot else None
     if args.save_plot or not args.no_plot:
-        plot_outer_edge_sweep(model, mission, show=not args.no_plot, save_path=plot_path)
+        plot_outer_edge_sweep(
+            model,
+            mission,
+            show=not args.no_plot,
+            save_path=plot_path,
+        )
     print_mission_summary(mission, json_path=json_path, csv_path=csv_path, plot_path=plot_path)
     return 0
 

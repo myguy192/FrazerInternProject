@@ -5,14 +5,16 @@ import unittest
 from pathlib import Path
 
 from dxf_importer import import_dxf
-from dxf_predictor import (
+from dxf_family_matcher import (
     LayoutPoint,
     ObservedSegment,
     ObservedTankGeometry,
     TankGeometry,
+    load_partial_dxf,
     load_reference_families,
     predict_from_observations,
     reconstruction_metrics,
+    save_completed_dxf,
 )
 from missing_dxf_generator import (
     SelectedSweep,
@@ -23,11 +25,12 @@ from missing_dxf_generator import (
 )
 from observation_region import build_observed_region_from_scan_poses
 from scan_profile import RainbowProfileConfig
-from tank_layout_predictor import clip_geometry_to_observed_region, observed_geometry_from_dxf
+from grid_predictor import clip_geometry_to_observed_region, observed_geometry_from_dxf
 
 
-ROOT = Path(__file__).parent
-EXAMPLES = ROOT / "3 Tank examples"
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES = ROOT / "examples" / "inputs"
+OUTPUT_EXAMPLES = ROOT / "examples" / "outputs"
 
 
 class DxfPredictionWorkflowTests(unittest.TestCase):
@@ -110,6 +113,52 @@ class DxfPredictionWorkflowTests(unittest.TestCase):
         self.assertEqual(result.status, "ambiguous")
         self.assertEqual(result.predicted_segments, [])
 
+    def test_ambiguous_family_match_uses_structural_grid_fallback(self):
+        observed, region = load_partial_dxf(OUTPUT_EXAMPLES / "uncompleted_dxf_24.dxf")
+
+        result = predict_from_observations(
+            observed,
+            self.families,
+            region,
+            minimum_score=1.1,
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertIsNone(result.selected_family)
+        self.assertEqual(result.completion_method, "structural_grid_fallback")
+        self.assertGreater(result.completion_confidence, 0.0)
+        self.assertTrue(result.predicted_segments)
+        self.assertTrue(all(segment.family == "structural_grid_fallback" for segment in result.predicted_segments))
+        with tempfile.TemporaryDirectory() as folder:
+            output = save_completed_dxf(result, Path(folder) / "fallback_completed.dxf")
+            self.assertTrue(output.is_file())
+
+    def test_existing_completed_24ft_and_65ft_outputs_are_unchanged(self):
+        for name in ("24ft", "65ft"):
+            with self.subTest(name=name):
+                observed, region = load_partial_dxf(
+                    OUTPUT_EXAMPLES / f"uncompleted_dxf_{name.removesuffix('ft')}.dxf"
+                )
+                result = predict_from_observations(observed, self.families, region)
+                saved_completion = observed_geometry_from_dxf(
+                    import_dxf(OUTPUT_EXAMPLES / f"dxf_completed_{name}.dxf")
+                )
+                metrics = reconstruction_metrics(result, saved_completion)
+
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.selected_family, f"{name}_family")
+                self.assertEqual(result.completion_method, "family_template")
+                self.assertEqual(
+                    _segment_signature_set(result.observed_segments + result.predicted_segments),
+                    _segment_signature_set(saved_completion.segments),
+                )
+                self.assertTrue(
+                    all(
+                        metrics[orientation][metric] == 1.0
+                        for orientation in ("vertical", "horizontal", "diagonal")
+                        for metric in ("precision", "recall")
+                    )
+                )
     def test_mission_selection_uses_exact_requested_rows(self):
         poses = []
         for row_id in range(3):
@@ -145,6 +194,15 @@ class DxfPredictionWorkflowTests(unittest.TestCase):
             imported.layer_names,
             {"TANK_BOUNDARY", "OBSERVED_CIRCULAR_SCAN", "SCAN_FOOTPRINTS"},
         )
+
+
+def _segment_signature_set(segments):
+    def signature(segment):
+        start = (round(segment.start.x, 9), round(segment.start.y, 9))
+        end = (round(segment.end.x, 9), round(segment.end.y, 9))
+        return tuple(sorted((start, end)))
+
+    return {signature(segment) for segment in segments}
 
 
 def _sweep_for_tank(tank, rows, start_angle=0.0):

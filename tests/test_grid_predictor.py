@@ -7,12 +7,12 @@ import numpy as np
 
 from dxf_importer import import_dxf
 from observation_region import (
-    build_observed_region_from_mission_json,
     build_observed_region_from_scan_poses,
     points_in_observed_region,
 )
+from path_planner import build_mission_plan
 from scan_profile import RainbowProfileConfig
-from tank_layout_predictor import (
+from grid_predictor import (
     LayoutPoint,
     ObservedSegment,
     ObservedTankGeometry,
@@ -101,7 +101,7 @@ def _circular_observation(full, row_fractions=(0.82, 0.62)):
     return observed_geometry_from_circular_sweeps(full, poses, profile)
 
 
-class TankLayoutPredictorTests(unittest.TestCase):
+class GridPredictorTests(unittest.TestCase):
     def test_no_dxf_runtime_observations_predict_layout(self):
         full = _synthetic_staggered_layout(10.0, 3.0, -2.0)
         observed, region = _circular_observation(full)
@@ -167,7 +167,7 @@ class TankLayoutPredictorTests(unittest.TestCase):
         self.assertTrue(any("Too few" in warning for warning in layout.warnings))
 
     def test_known_dxf_masking_and_scaled_variants(self):
-        examples = Path(__file__).parent / "3 Tank examples"
+        examples = Path(__file__).resolve().parents[1] / "examples" / "inputs"
         for filename in ("24ft.dxf", "65ft.dxf", "150ft.dxf"):
             with self.subTest(filename=filename):
                 full = observed_geometry_from_dxf(import_dxf(examples / filename))
@@ -196,9 +196,17 @@ class TankLayoutPredictorTests(unittest.TestCase):
                 )
 
     def test_24ft_mission_footprints_clip_hidden_geometry(self):
-        root = Path(__file__).parent
-        full = observed_geometry_from_dxf(import_dxf(root / "3 Tank examples" / "24ft.dxf"))
-        region = build_observed_region_from_mission_json(root / "mission_plan.json")
+        root = Path(__file__).resolve().parents[1]
+        model = import_dxf(root / "examples" / "inputs" / "24ft.dxf")
+        full = observed_geometry_from_dxf(model)
+        mission = build_mission_plan(model)
+        profile = RainbowProfileConfig(
+            width=float(mission.scan_profile["width_m"]),
+            arc_radius=float(mission.scan_profile["arc_radius_m"]),
+            side_height=float(mission.scan_profile["side_height_m"]),
+            arc_samples=int(mission.scan_profile["arc_samples"]),
+        )
+        region = build_observed_region_from_scan_poses(mission.poses, profile)
         observed = clip_geometry_to_observed_region(full, region)
         layout = predict_tank_layout(observed)
 

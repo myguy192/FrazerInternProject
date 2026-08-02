@@ -1,0 +1,77 @@
+{
+  "status": "completed",
+  "selected_family": "65ft_family",
+  "family_scores": [
+    {
+      "family": "65ft_family",
+      "score": 0.9998034225753814,
+      "observed_coverage": 0.9999999999999991,
+      "expected_visible_coverage": 0.9999999999999991,
+      "position_orientation_score": 0.999999999999999,
+      "feature_score": 0.9980342257538206,
+      "rotation_deg": -1.1934808509245677e-15,
+      "reflected": false,
+      "spacing_refinement": 1.0,
+      "phase_offset_normalized_x": 0.0,
+      "phase_offset_normalized_y": 0.0,
+      "expected_visible_segments": 56,
+      "fitting_error_normalized": 1.734753971218342e-17
+    },
+    {
+      "family": "150ft_family",
+      "score": 0.26785856732227065,
+      "observed_coverage": 0.25760590450098964,
+      "expected_visible_coverage": 0.11163065211570644,
+      "position_orientation_score": 0.405577893693211,
+      "feature_score": 0.5761003060813171,
+      "rotation_deg": -1.1934808509245677e-15,
+      "reflected": false,
+      "spacing_refinement": 0.9975,
+      "phase_offset_normalized_x": -0.005081738607385797,
+      "phase_offset_normalized_y": -3.3771995874110697e-16,
+      "expected_visible_segments": 261,
+      "fitting_error_normalized": 0.007918820546331737
+    },
+    {
+      "family": "24ft_family",
+      "score": 0.20483118769130115,
+      "observed_coverage": 0.1358988075493364,
+      "expected_visible_coverage": 0.2808060714320167,
+      "position_orientation_score": 0.0953290254450745,
+      "feature_score": 0.4513554904773359,
+      "rotation_deg": -1.1934808509245677e-15,
+      "reflected": false,
+      "spacing_refinement": 1.0150000000000001,
+      "phase_offset_normalized_x": -0.019575359703597306,
+      "phase_offset_normalized_y": 0.0008645538104790078,
+      "expected_visible_segments": 20,
+      "fitting_error_normalized": 0.0041664706158336525
+    }
+  ],
+  "confidence": 0.9998034225753814,
+  "completion_method": "family_template",
+  "score_margin": 0.7319448552531107,
+  "target_center_m": {
+    "x": 0.0,
+    "y": 0.0
+  },
+  "target_radius_m": 10.43961504358715,
+  "scale_fit": 10.43961504358715,
+  "rotation_fit_deg": -1.193480850924568e-15,
+  "reflected": false,
+  "phase_offset_normalized": {
+    "x": 0.0,
+    "y": 0.0
+  },
+  "spacing_refinement": 1.0,
+  "observed_line_count": 90,
+  "observed_length_m": 131.43942963606955,
+  "predicted_line_count": 32,
+  "predicted_length_m": 137.15704446859806,
+  "warnings": [],
+  "output_paths": {
+    "dxf": "examples/outputs/dxf_completed_65ft.dxf",
+    "plot": "examples/outputs/dxf_completed_65ft.png",
+    "report": "examples/outputs/dxf_completed_65ft_report.json"
+  }
+}

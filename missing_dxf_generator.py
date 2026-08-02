@@ -10,7 +10,7 @@ from typing import Any
 from dxf_importer import DxfImportError, GeometryModel, import_dxf
 from observation_region import ScanFootprintRegion, build_observed_region_from_scan_poses
 from scan_profile import RainbowProfileConfig
-from tank_layout_predictor import (
+from grid_predictor import (
     ObservedTankGeometry,
     clip_geometry_to_observed_region,
     observed_geometry_from_dxf,

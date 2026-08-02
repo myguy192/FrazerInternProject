@@ -207,7 +207,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Tank planner generated outputs
+# Tank planner generated outputs. Curated artifacts under examples/outputs are tracked.
 *.pyc
 mission_plan.json
 mission_plan.csv
@@ -219,7 +219,9 @@ best_*_mission_plan.json
 best_*_mission_preview.png
 sweep_strategy_results.csv
 sweep_strategy_results.json
-weekly_checkin_2026_07_07/
+completed_predicted_layout.dxf
+completed_predicted_layout.png
+prediction_report.json
 *_backup.py
 *BROKEN*
 *ruined*
